@@ -22,6 +22,7 @@ public:
     void clear();
     void step(float dt);
 
+    std::vector<std::unique_ptr<Body>>& bodies() { return bodies_; }
     const std::vector<std::unique_ptr<Body>>& bodies() const { return bodies_; }
     const std::vector<Contact>& contacts() const { return contacts_; }
 
