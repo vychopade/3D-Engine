@@ -11,8 +11,10 @@ namespace physics {
 class World {
 public:
     Vec3 gravity{0.0f, -9.81f, 0.0f};
-    int velocity_iterations = 8;
-    int position_iterations = 3;
+    int velocity_iterations = 12;
+    int position_iterations = 8;
+    float max_substep = 1.0f / 120.0f;
+    int max_substeps = 8;
 
     Body* add_sphere(Vec3 position, float radius, float density = 1.0f,
                      BodyType type = BodyType::Dynamic);
@@ -30,10 +32,11 @@ private:
     std::vector<std::unique_ptr<Body>> bodies_;
     std::vector<Contact> contacts_;
 
+    void step_once(float dt);
     void integrate_velocities(float dt);
     void integrate_positions(float dt);
     void find_contacts();
-    void solve_velocities();
+    void solve_velocities(float dt);
     void solve_positions();
 };
 

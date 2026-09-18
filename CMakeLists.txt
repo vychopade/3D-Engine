@@ -20,6 +20,7 @@ target_compile_options(physics PRIVATE
 )
 
 include(FetchContent)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(raylib

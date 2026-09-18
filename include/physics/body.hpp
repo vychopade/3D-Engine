@@ -21,6 +21,7 @@ struct Shape {
 
 struct Body {
     Vec3 position;
+    Vec3 prev_position;
     Vec3 velocity;
     Vec3 force;
 

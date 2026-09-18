@@ -86,6 +86,46 @@ int main() {
         CHECK(a->position.x < b->position.x);
     }
 
+    {
+        World world;
+        world.add_box({0.0f, -0.5f, 0.0f}, {10.0f, 0.5f, 10.0f}, 1.0f, BodyType::Static);
+        auto* ball = world.add_sphere({0.0f, -0.7f, 0.0f}, 0.4f);
+        ball->prev_position = {0.0f, 0.6f, 0.0f};
+        ball->velocity = {0.0f, -8.0f, 0.0f};
+        Contact c;
+        CHECK(collide(*ball, *world.bodies().front().get(), c));
+        CHECK(c.normal.y < 0.0f);
+    }
+
+    {
+        World world;
+        world.gravity = {0.0f, -9.81f, 0.0f};
+        world.add_box({0.0f, -0.5f, 0.0f}, {10.0f, 0.5f, 10.0f}, 1.0f, BodyType::Static);
+        auto* ball = world.add_sphere({0.0f, 4.0f, 0.0f}, 0.5f);
+        ball->velocity = {0.0f, -55.0f, 0.0f};
+        ball->restitution = 0.0f;
+        for (int i = 0; i < 180; ++i) {
+            world.step(1.0f / 60.0f);
+        }
+        CHECK(std::isfinite(ball->position.y));
+        CHECK(ball->position.y > 0.35f);
+        CHECK(ball->position.y < 2.5f);
+    }
+
+    {
+        World world;
+        world.gravity = {0.0f, -9.81f, 0.0f};
+        world.add_box({0.0f, -0.5f, 0.0f}, {10.0f, 0.5f, 10.0f}, 1.0f, BodyType::Static);
+        auto* box = world.add_box({0.0f, 5.0f, 0.0f}, {0.5f, 0.5f, 0.5f});
+        box->restitution = 0.05f;
+        for (int i = 0; i < 240; ++i) {
+            world.step(1.0f / 60.0f);
+        }
+        CHECK(std::isfinite(box->position.y));
+        CHECK(box->position.y > 0.4f);
+        CHECK(box->position.y < 1.3f);
+    }
+
     if (g_failed == 0) {
         std::cout << "All tests passed.\n";
         return 0;
