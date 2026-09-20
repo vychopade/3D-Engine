@@ -22,6 +22,7 @@ public:
                   BodyType type = BodyType::Dynamic);
 
     void clear();
+    bool destroy_body(Body* body);
     void step(float dt);
 
     std::vector<std::unique_ptr<Body>>& bodies() { return bodies_; }

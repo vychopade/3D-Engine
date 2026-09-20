@@ -1,4 +1,5 @@
 #include "physics/physics.hpp"
+#include "ui.hpp"
 
 #include "raylib.h"
 #include "raymath.h"
@@ -7,8 +8,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 using physics::Body;
@@ -20,29 +25,60 @@ using physics::World;
 
 namespace {
 
-const Color kPalette[] = {
-    {239, 83, 80, 255},  {66, 165, 245, 255}, {102, 187, 106, 255}, {255, 167, 38, 255},
-    {171, 71, 188, 255}, {38, 198, 218, 255}, {255, 202, 40, 255},  {239, 154, 154, 255},
-};
-
 constexpr float kMouseSens = 0.0025f;
-constexpr float kFlySpeed = 12.0f;
+constexpr float kFlySpeed = 14.0f;
 constexpr float kWalkSpeed = 7.0f;
 constexpr float kJumpSpeed = 6.5f;
-constexpr float kPlaceDistance = 5.0f;
+constexpr const char* kSavePath = "worlds/scene.world";
+
+const Color kPalette[] = {
+    {239, 83, 80, 255},  {66, 165, 245, 255}, {102, 187, 106, 255}, {255, 167, 38, 255},
+    {171, 71, 188, 255}, {38, 198, 218, 255}, {255, 202, 40, 255},  {120, 144, 156, 255},
+};
 
 Vec3 to_vec(Vector3 v) { return {v.x, v.y, v.z}; }
 Vector3 to_rl(Vec3 v) { return {v.x, v.y, v.z}; }
+
+float snap_value(float v, float step) {
+    if (step <= 1e-6f) {
+        return v;
+    }
+    return std::round(v / step) * step;
+}
+
+Vec3 snap_vec(Vec3 v, float step) { return {snap_value(v.x, step), snap_value(v.y, step), snap_value(v.z, step)}; }
+
+enum class Tool { Select, Sphere, Box, Floor, Wall, Ramp };
+enum class Kind { Sphere, Box, Floor, Wall, Ramp };
+
+struct Entity {
+    Body* body = nullptr;
+    Kind kind = Kind::Box;
+    Color color{90, 96, 110, 255};
+    float density = 1.0f;
+    char name[48]{"Object"};
+};
 
 struct RayHit {
     Body* body = nullptr;
     float t = 0.0f;
     Vec3 point;
+    Vec3 normal{0.0f, 1.0f, 0.0f};
 };
 
-bool ray_aabb(Vec3 origin, Vec3 dir, Vec3 half, float& t_hit) {
+struct PoseSnap {
+    Body* body = nullptr;
+    Vec3 position;
+    Vec3 velocity;
+    Vec3 angular_velocity;
+    Quat orientation;
+};
+
+bool ray_aabb(Vec3 origin, Vec3 dir, Vec3 half, float& t_hit, Vec3& local_n) {
     float tmin = 0.0f;
     float tmax = 1.0e6f;
+    int enter_axis = -1;
+    float enter_sign = 1.0f;
     const float orig[3] = {origin.x, origin.y, origin.z};
     const float d[3] = {dir.x, dir.y, dir.z};
     const float h[3] = {half.x, half.y, half.z};
@@ -56,10 +92,17 @@ bool ray_aabb(Vec3 origin, Vec3 dir, Vec3 half, float& t_hit) {
         }
         float t1 = (-h[i] - orig[i]) / d[i];
         float t2 = (h[i] - orig[i]) / d[i];
+        float s1 = -1.0f;
+        float s2 = 1.0f;
         if (t1 > t2) {
             std::swap(t1, t2);
+            std::swap(s1, s2);
         }
-        tmin = std::max(tmin, t1);
+        if (t1 > tmin) {
+            tmin = t1;
+            enter_axis = i;
+            enter_sign = s1;
+        }
         tmax = std::min(tmax, t2);
         if (tmin > tmax) {
             return false;
@@ -67,6 +110,16 @@ bool ray_aabb(Vec3 origin, Vec3 dir, Vec3 half, float& t_hit) {
     }
 
     t_hit = tmin >= 0.0f ? tmin : tmax;
+    local_n = {};
+    if (enter_axis == 0) {
+        local_n.x = enter_sign;
+    } else if (enter_axis == 1) {
+        local_n.y = enter_sign;
+    } else if (enter_axis == 2) {
+        local_n.z = enter_sign;
+    } else {
+        local_n.y = 1.0f;
+    }
     return t_hit >= 0.0f;
 }
 
@@ -82,11 +135,11 @@ bool ray_sphere(Vec3 origin, Vec3 dir, Vec3 center, float radius, float& t_hit) 
     const float sqrt_d = std::sqrt(disc);
     const float t0 = (-b - sqrt_d) / (2.0f * a);
     const float t1 = (-b + sqrt_d) / (2.0f * a);
-    t_hit = t0 >= 0.05f ? t0 : t1;
-    return t_hit >= 0.05f;
+    t_hit = t0 >= 0.02f ? t0 : t1;
+    return t_hit >= 0.02f;
 }
 
-std::optional<RayHit> raycast(World& world, Vec3 origin, Vec3 dir, const Body* ignore) {
+std::optional<RayHit> raycast_world(World& world, Vec3 origin, Vec3 dir, const Body* ignore) {
     std::optional<RayHit> best;
     float best_t = std::numeric_limits<float>::max();
 
@@ -95,71 +148,43 @@ std::optional<RayHit> raycast(World& world, Vec3 origin, Vec3 dir, const Body* i
         if (body == ignore) {
             continue;
         }
-
         float t = 0.0f;
+        Vec3 normal{0.0f, 1.0f, 0.0f};
         bool hit = false;
         if (body->shape.type == ShapeType::Sphere) {
             hit = ray_sphere(origin, dir, body->position, body->shape.radius, t);
+            if (hit) {
+                Vec3 n = origin + dir * t - body->position;
+                normal = n.length_sq() > 1e-8f ? n.normalized() : Vec3{0.0f, 1.0f, 0.0f};
+            }
         } else {
             const Vec3 local_o = body->world_to_local(origin);
             const Vec3 local_d = body->rotation().transposed() * dir;
-            hit = ray_aabb(local_o, local_d, body->shape.half_extents, t);
+            Vec3 local_n;
+            hit = ray_aabb(local_o, local_d, body->shape.half_extents, t, local_n);
+            if (hit) {
+                normal = body->rotation() * local_n;
+                const float nlen = normal.length();
+                normal = nlen > 1e-8f ? normal / nlen : Vec3{0.0f, 1.0f, 0.0f};
+            }
         }
-
         if (hit && t > 0.05f && t < best_t) {
             best_t = t;
-            best = RayHit{body, t, origin + dir * t};
+            best = RayHit{body, t, origin + dir * t, normal};
         }
     }
     return best;
 }
 
-void populate(World& world) {
-    world.clear();
-
-    world.add_box({0.0f, -0.5f, 0.0f}, {12.0f, 0.5f, 12.0f}, 1.0f, BodyType::Static);
-
-    Body* ramp = world.add_box({4.0f, 1.6f, 0.0f}, {3.5f, 0.18f, 2.2f}, 1.0f, BodyType::Static);
-    ramp->orientation = Quat::from_axis_angle({0.0f, 0.0f, 1.0f}, -0.32f);
-
-    world.add_box({-8.5f, 2.0f, 0.0f}, {0.25f, 2.0f, 6.0f}, 1.0f, BodyType::Static);
-    world.add_box({8.5f, 2.0f, 0.0f}, {0.25f, 2.0f, 6.0f}, 1.0f, BodyType::Static);
-    world.add_box({0.0f, 2.0f, -8.5f}, {8.5f, 2.0f, 0.25f}, 1.0f, BodyType::Static);
-
-    for (int i = 0; i < 8; ++i) {
-        const float x = -3.0f + static_cast<float>(i % 4) * 1.4f;
-        const float z = -1.5f + static_cast<float>(i / 4) * 1.6f;
-        Body* ball = world.add_sphere({x, 7.0f + 0.4f * static_cast<float>(i), z},
-                                      0.38f + 0.04f * static_cast<float>(i % 3), 1.0f);
-        ball->restitution = 0.4f;
-        ball->friction = 0.3f;
+std::optional<RayHit> raycast_ground(Vec3 origin, Vec3 dir) {
+    if (std::abs(dir.y) < 1e-6f) {
+        return std::nullopt;
     }
-
-    for (int i = 0; i < 6; ++i) {
-        Body* crate = world.add_box({-2.0f + static_cast<float>(i % 3) * 1.3f, 4.5f + static_cast<float>(i / 3) * 1.2f,
-                                     2.5f},
-                                    {0.45f, 0.45f, 0.45f}, 1.1f);
-        crate->restitution = 0.15f;
-        crate->friction = 0.5f;
-        crate->orientation = Quat::from_axis_angle({0.0f, 1.0f, 0.2f}, 0.2f * static_cast<float>(i));
+    const float t = -origin.y / dir.y;
+    if (t < 0.2f || t > 250.0f) {
+        return std::nullopt;
     }
-
-    Body* plank = world.add_box({-1.0f, 8.5f, 0.5f}, {1.6f, 0.16f, 0.45f}, 0.7f);
-    plank->restitution = 0.2f;
-    plank->orientation = Quat::from_axis_angle({0.0f, 0.0f, 1.0f}, 0.45f);
-}
-
-Color color_for(std::size_t index, const Body& body, bool hovered) {
-    if (body.type == BodyType::Static) {
-        return hovered ? Color{140, 150, 170, 255} : Color{90, 96, 110, 255};
-    }
-    Color c = kPalette[index % (sizeof(kPalette) / sizeof(kPalette[0]))];
-    if (hovered) {
-        c.r = static_cast<unsigned char>(std::min(255, c.r + 50));
-        c.g = static_cast<unsigned char>(std::min(255, c.g + 50));
-        c.b = static_cast<unsigned char>(std::min(255, c.b + 50));
-    }
-    return c;
+    return RayHit{nullptr, t, origin + dir * t, {0.0f, 1.0f, 0.0f}};
 }
 
 void draw_body(const Body& body, Color color) {
@@ -169,7 +194,6 @@ void draw_body(const Body& body, Color color) {
         DrawSphereWires(pos, body.shape.radius, 12, 12, ColorAlpha(BLACK, 0.35f));
         return;
     }
-
     const Quaternion q{body.orientation.x, body.orientation.y, body.orientation.z, body.orientation.w};
     rlPushMatrix();
     rlTranslatef(pos.x, pos.y, pos.z);
@@ -182,32 +206,21 @@ void draw_body(const Body& body, Color color) {
 
 struct Controller {
     float yaw = 0.7f;
-    float pitch = -0.25f;
-    Vector3 eye{8.0f, 3.5f, 8.0f};
+    float pitch = -0.35f;
+    Vector3 eye{12.0f, 8.0f, 12.0f};
     Body* possessed = nullptr;
-    Body* last_placed = nullptr;
     float saved_restitution = 0.0f;
     float saved_friction = 0.0f;
     float saved_ang_damp = 0.0f;
+    bool looking = false;
 
     Vec3 forward() const {
         const float cp = std::cos(pitch);
         return {std::sin(yaw) * cp, std::sin(pitch), std::cos(yaw) * cp};
     }
-
-    Vec3 flat_forward() const {
-        Vec3 f{std::sin(yaw), 0.0f, std::cos(yaw)};
-        return f.normalized();
-    }
-
-    Vec3 right() const {
-        const Vec3 f = forward();
-        return physics::cross(f, {0.0f, 1.0f, 0.0f}).normalized();
-    }
-
-    Vec3 flat_right() const {
-        return physics::cross(flat_forward(), {0.0f, 1.0f, 0.0f}).normalized();
-    }
+    Vec3 flat_forward() const { return Vec3{std::sin(yaw), 0.0f, std::cos(yaw)}.normalized(); }
+    Vec3 right() const { return physics::cross(forward(), {0.0f, 1.0f, 0.0f}).normalized(); }
+    Vec3 flat_right() const { return physics::cross(flat_forward(), {0.0f, 1.0f, 0.0f}).normalized(); }
 
     void look() {
         const Vector2 delta = GetMouseDelta();
@@ -231,15 +244,12 @@ struct Controller {
         possessed->friction = saved_friction;
         possessed->angular_damping = saved_ang_damp;
         possessed->angular_velocity = {};
-        eye = to_rl(possessed->position + Vec3{0.0f, 0.6f, 0.0f});
+        eye = to_rl(possessed->position + Vec3{0.0f, 0.8f, 0.0f});
         possessed = nullptr;
     }
 
     void possess(Body* body) {
         if (body == nullptr || body->type != BodyType::Dynamic) {
-            return;
-        }
-        if (possessed == body) {
             return;
         }
         release();
@@ -254,27 +264,297 @@ struct Controller {
     }
 };
 
-Vec3 placement_point(const Controller& ctrl, const std::optional<RayHit>& look_hit) {
-    const Vec3 origin = to_vec(ctrl.eye);
-    const Vec3 dir = ctrl.forward();
-    if (look_hit && look_hit->body != ctrl.possessed) {
-        return look_hit->point - dir * 0.55f;
+struct Editor {
+    World world;
+    std::vector<Entity> entities;
+    Controller ctrl;
+    Tool tool = Tool::Select;
+    Body* selected = nullptr;
+    Body* dragging = nullptr;
+    float drag_y = 0.0f;
+    bool playing = false;
+    bool grid_snap = true;
+    float snap = 0.5f;
+    std::vector<PoseSnap> snapshot;
+    std::string status = "Place a floor, then add objects. Right-drag to look.";
+    int counters[6]{};
+
+    Color brush_color{66, 165, 245, 255};
+    bool place_dynamic = true;
+    float sphere_r = 0.5f;
+    Vec3 box_half{0.45f, 0.45f, 0.45f};
+    Vec3 floor_half{5.0f, 0.15f, 5.0f};
+    Vec3 wall_half{0.12f, 1.6f, 3.0f};
+    Vec3 ramp_half{2.4f, 0.12f, 1.6f};
+    float ramp_angle = 0.35f;
+
+    Entity* find(Body* body) {
+        for (auto& e : entities) {
+            if (e.body == body) {
+                return &e;
+            }
+        }
+        return nullptr;
     }
-    return origin + dir * kPlaceDistance;
-}
 
-Body* spawn_sphere(World& world, Vec3 at) {
-    Body* ball = world.add_sphere(at, 0.45f, 1.0f);
-    ball->restitution = 0.45f;
-    ball->friction = 0.3f;
-    return ball;
-}
+    void bind(Body* body, Kind kind, Color color, float density, const char* prefix) {
+        Entity e;
+        e.body = body;
+        e.kind = kind;
+        e.color = color;
+        e.density = density;
+        const int idx = ++counters[static_cast<int>(kind)];
+        std::snprintf(e.name, sizeof(e.name), "%s_%d", prefix, idx);
+        body->user_data = &entities.emplace_back(e);
+        // user_data will dangle if vector reallocates — fix after push by rebinding all
+        rebind_user_data();
+    }
 
-Body* spawn_box(World& world, Vec3 at) {
-    Body* box = world.add_box(at, {0.4f, 0.4f, 0.4f}, 1.0f);
-    box->restitution = 0.18f;
-    box->friction = 0.5f;
-    return box;
+    void rebind_user_data() {
+        for (auto& e : entities) {
+            if (e.body != nullptr) {
+                e.body->user_data = &e;
+            }
+        }
+    }
+
+    void remove_entity(Body* body) {
+        if (selected == body) {
+            selected = nullptr;
+        }
+        if (dragging == body) {
+            dragging = nullptr;
+        }
+        if (ctrl.possessed == body) {
+            ctrl.release();
+        }
+        entities.erase(std::remove_if(entities.begin(), entities.end(),
+                                      [body](const Entity& e) { return e.body == body; }),
+                       entities.end());
+        world.destroy_body(body);
+        rebind_user_data();
+    }
+
+    void clear_world() {
+        ctrl.release();
+        selected = nullptr;
+        dragging = nullptr;
+        entities.clear();
+        world.clear();
+        snapshot.clear();
+        playing = false;
+        for (int& c : counters) {
+            c = 0;
+        }
+    }
+
+    Quat wall_orientation() const { return Quat::from_axis_angle({0.0f, 1.0f, 0.0f}, ctrl.yaw + 1.5707963f); }
+
+    Body* spawn(Kind kind, Vec3 at, Vec3 normal) {
+        const Color color = brush_color;
+        const bool dynamic = (kind == Kind::Sphere || kind == Kind::Box) && place_dynamic;
+        const BodyType type = dynamic ? BodyType::Dynamic : BodyType::Static;
+        const float density = 1.0f;
+        Body* body = nullptr;
+        const char* prefix = "Object";
+
+        Vec3 n = normal.length_sq() > 1e-8f ? normal.normalized() : Vec3{0.0f, 1.0f, 0.0f};
+        if (grid_snap) {
+            at = snap_vec(at, snap);
+        }
+
+        switch (kind) {
+            case Kind::Sphere:
+                at += n * sphere_r;
+                body = world.add_sphere(at, sphere_r, density, type);
+                body->restitution = 0.4f;
+                body->friction = 0.3f;
+                prefix = "Sphere";
+                break;
+            case Kind::Box:
+                at += n * box_half.y;
+                body = world.add_box(at, box_half, density, type);
+                body->restitution = 0.15f;
+                body->friction = 0.45f;
+                prefix = "Box";
+                break;
+            case Kind::Floor:
+                at += Vec3{0.0f, floor_half.y, 0.0f};
+                body = world.add_box(at, floor_half, density, BodyType::Static);
+                body->restitution = 0.1f;
+                body->friction = 0.7f;
+                prefix = "Floor";
+                break;
+            case Kind::Wall: {
+                if (std::abs(n.y) > 0.65f) {
+                    at.y += wall_half.y;
+                } else {
+                    at += n * wall_half.x;
+                    at.y += wall_half.y;
+                }
+                body = world.add_box(at, wall_half, density, BodyType::Static);
+                body->orientation = wall_orientation();
+                body->restitution = 0.1f;
+                body->friction = 0.6f;
+                prefix = "Wall";
+                break;
+            }
+            case Kind::Ramp:
+                at += Vec3{0.0f, ramp_half.y + 0.8f, 0.0f};
+                body = world.add_box(at, ramp_half, density, BodyType::Static);
+                body->orientation = Quat::from_axis_angle({0.0f, 0.0f, 1.0f}, -ramp_angle) *
+                                    Quat::from_axis_angle({0.0f, 1.0f, 0.0f}, ctrl.yaw);
+                body->restitution = 0.05f;
+                body->friction = 0.8f;
+                prefix = "Ramp";
+                break;
+        }
+
+        if (body == nullptr) {
+            return nullptr;
+        }
+        bind(body, kind, color, density, prefix);
+        selected = body;
+        return body;
+    }
+
+    void new_world() {
+        clear_world();
+        spawn(Kind::Floor, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+        selected = nullptr;
+        status = "New world. Use Floor / Wall / Ramp / Box / Sphere to build.";
+    }
+
+    void begin_play() {
+        snapshot.clear();
+        for (auto& e : entities) {
+            Body* b = e.body;
+            snapshot.push_back({b, b->position, b->velocity, b->angular_velocity, b->orientation});
+        }
+        playing = true;
+        tool = Tool::Select;
+        dragging = nullptr;
+        status = "Play mode. F possess a dynamic object. Stop to restore the edit pose.";
+    }
+
+    void stop_play() {
+        ctrl.release();
+        for (const auto& s : snapshot) {
+            if (find(s.body) == nullptr) {
+                continue;
+            }
+            s.body->position = s.position;
+            s.body->prev_position = s.position;
+            s.body->velocity = {};
+            s.body->angular_velocity = {};
+            s.body->orientation = s.orientation;
+            s.body->force = {};
+            s.body->torque = {};
+        }
+        snapshot.clear();
+        playing = false;
+        status = "Edit mode. Physics paused.";
+    }
+
+    bool save(const char* path) {
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        std::ofstream out(path);
+        if (!out) {
+            status = "Save failed.";
+            return false;
+        }
+        out << "PEWORLD 1\n";
+        out << "gravity " << world.gravity.x << ' ' << world.gravity.y << ' ' << world.gravity.z << '\n';
+        out << "count " << entities.size() << '\n';
+        for (const auto& e : entities) {
+            const Body& b = *e.body;
+            out << static_cast<int>(e.kind) << ' ' << e.name << ' ' << static_cast<int>(e.color.r) << ' '
+                << static_cast<int>(e.color.g) << ' ' << static_cast<int>(e.color.b) << ' ' << e.density << ' '
+                << static_cast<int>(b.type) << ' ' << b.restitution << ' ' << b.friction << ' ' << b.position.x << ' '
+                << b.position.y << ' ' << b.position.z << ' ' << b.orientation.w << ' ' << b.orientation.x << ' '
+                << b.orientation.y << ' ' << b.orientation.z << ' ' << b.shape.radius << ' ' << b.shape.half_extents.x
+                << ' ' << b.shape.half_extents.y << ' ' << b.shape.half_extents.z << '\n';
+        }
+        status = std::string("Saved ") + path;
+        return true;
+    }
+
+    bool load(const char* path) {
+        std::ifstream in(path);
+        if (!in) {
+            status = "No saved world yet. Build something, then Save.";
+            return false;
+        }
+        std::string magic;
+        int version = 0;
+        in >> magic >> version;
+        if (magic != "PEWORLD") {
+            status = "Unrecognized world file.";
+            return false;
+        }
+        std::string tag;
+        in >> tag >> world.gravity.x >> world.gravity.y >> world.gravity.z;
+        std::size_t count = 0;
+        in >> tag >> count;
+        clear_world();
+        for (std::size_t i = 0; i < count; ++i) {
+            int kind_i = 0, cr = 0, cg = 0, cb = 0, type_i = 0;
+            char name[48];
+            float density, rest, fric, px, py, pz, qw, qx, qy, qz, radius, hx, hy, hz;
+            in >> kind_i >> name >> cr >> cg >> cb >> density >> type_i >> rest >> fric >> px >> py >> pz >> qw >> qx >>
+                qy >> qz >> radius >> hx >> hy >> hz;
+            if (!in) {
+                break;
+            }
+            const Kind kind = static_cast<Kind>(kind_i);
+            const BodyType type = static_cast<BodyType>(type_i);
+            Body* body = nullptr;
+            if (kind == Kind::Sphere) {
+                body = world.add_sphere({px, py, pz}, radius, density, type);
+            } else {
+                body = world.add_box({px, py, pz}, {hx, hy, hz}, density, type);
+            }
+            body->orientation = {qw, qx, qy, qz};
+            body->restitution = rest;
+            body->friction = fric;
+            bind(body, kind, Color{static_cast<unsigned char>(cr), static_cast<unsigned char>(cg),
+                                   static_cast<unsigned char>(cb), 255},
+                 density, "Loaded");
+            std::snprintf(entities.back().name, sizeof(entities.back().name), "%s", name);
+        }
+        selected = nullptr;
+        status = std::string("Loaded ") + path;
+        return true;
+    }
+};
+
+void fly(Controller& ctrl, float dt) {
+    Vec3 wish{};
+    if (IsKeyDown(KEY_W)) {
+        wish += ctrl.forward();
+    }
+    if (IsKeyDown(KEY_S)) {
+        wish -= ctrl.forward();
+    }
+    if (IsKeyDown(KEY_D)) {
+        wish += ctrl.right();
+    }
+    if (IsKeyDown(KEY_A)) {
+        wish -= ctrl.right();
+    }
+    if (IsKeyDown(KEY_SPACE) && ctrl.possessed == nullptr) {
+        wish += Vec3{0.0f, 1.0f, 0.0f};
+    }
+    if (IsKeyDown(KEY_LEFT_CONTROL)) {
+        wish -= Vec3{0.0f, 1.0f, 0.0f};
+    }
+    const float speed = IsKeyDown(KEY_LEFT_SHIFT) ? kFlySpeed * 2.2f : kFlySpeed;
+    if (wish.length_sq() > 1e-6f) {
+        wish = wish.normalized();
+        ctrl.eye.x += wish.x * speed * dt;
+        ctrl.eye.y += wish.y * speed * dt;
+        ctrl.eye.z += wish.z * speed * dt;
+    }
 }
 
 bool is_grounded(const World& world, const Body& body) {
@@ -291,10 +571,6 @@ bool is_grounded(const World& world, const Body& body) {
 
 void drive_possessed(Controller& ctrl, World& world, float /*dt*/) {
     Body* body = ctrl.possessed;
-    if (body == nullptr) {
-        return;
-    }
-
     Vec3 wish{};
     if (IsKeyDown(KEY_W)) {
         wish += ctrl.flat_forward();
@@ -311,46 +587,38 @@ void drive_possessed(Controller& ctrl, World& world, float /*dt*/) {
     if (wish.length_sq() > 1e-6f) {
         wish = wish.normalized() * kWalkSpeed;
     }
-
     body->velocity.x = wish.x;
     body->velocity.z = wish.z;
     body->angular_velocity = {};
     body->orientation = Quat::from_axis_angle({0.0f, 1.0f, 0.0f}, ctrl.yaw);
-
     if (IsKeyPressed(KEY_SPACE) && is_grounded(world, *body)) {
         body->velocity.y = kJumpSpeed;
     }
-
     ctrl.eye = to_rl(body->position);
 }
 
-void fly_spectator(Controller& ctrl, float dt) {
-    Vec3 wish{};
-    if (IsKeyDown(KEY_W)) {
-        wish += ctrl.forward();
+Kind kind_from_tool(Tool tool) {
+    switch (tool) {
+        case Tool::Sphere:
+            return Kind::Sphere;
+        case Tool::Box:
+            return Kind::Box;
+        case Tool::Floor:
+            return Kind::Floor;
+        case Tool::Wall:
+            return Kind::Wall;
+        case Tool::Ramp:
+            return Kind::Ramp;
+        default:
+            return Kind::Box;
     }
-    if (IsKeyDown(KEY_S)) {
-        wish -= ctrl.forward();
-    }
-    if (IsKeyDown(KEY_D)) {
-        wish += ctrl.right();
-    }
-    if (IsKeyDown(KEY_A)) {
-        wish -= ctrl.right();
-    }
-    if (IsKeyDown(KEY_SPACE)) {
-        wish += Vec3{0.0f, 1.0f, 0.0f};
-    }
-    if (IsKeyDown(KEY_LEFT_CONTROL)) {
-        wish -= Vec3{0.0f, 1.0f, 0.0f};
-    }
+}
 
-    const float speed = IsKeyDown(KEY_LEFT_SHIFT) ? kFlySpeed * 2.0f : kFlySpeed;
-    if (wish.length_sq() > 1e-6f) {
-        wish = wish.normalized();
-        ctrl.eye.x += wish.x * speed * dt;
-        ctrl.eye.y += wish.y * speed * dt;
-        ctrl.eye.z += wish.z * speed * dt;
+void apply_shape(Entity& e) {
+    Body& b = *e.body;
+    physics::compute_mass(b, e.density);
+    if (b.type != BodyType::Dynamic) {
+        b.set_type(BodyType::Static);
     }
 }
 
@@ -358,115 +626,430 @@ void fly_spectator(Controller& ctrl, float dt) {
 
 int main() {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI);
-    InitWindow(1280, 720, "Physics Engine 3D");
+    InitWindow(1440, 860, "Physics World Builder");
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
-    DisableCursor();
 
     Camera3D camera{};
     camera.up = {0.0f, 1.0f, 0.0f};
-    camera.fovy = 70.0f;
+    camera.fovy = 60.0f;
     camera.projection = CAMERA_PERSPECTIVE;
 
-    World world;
-    populate(world);
-
-    Controller ctrl;
+    Editor editor;
+    editor.new_world();
+    ui::State ui;
 
     while (!WindowShouldClose()) {
         const float dt = std::min(GetFrameTime(), 1.0f / 30.0f);
-        ctrl.look();
+        ui.begin();
 
-        if (IsKeyPressed(KEY_Q)) {
+        const int sw = GetScreenWidth();
+        const int sh = GetScreenHeight();
+        const Rectangle top{0, 0, static_cast<float>(sw), 48};
+        const Rectangle left{0, 48, 188, static_cast<float>(sh - 76)};
+        const Rectangle right{static_cast<float>(sw - 300), 48, 300, static_cast<float>(sh - 76)};
+        const Rectangle bottom{0, static_cast<float>(sh - 28), static_cast<float>(sw), 28};
+        const Rectangle viewport{188, 48, static_cast<float>(sw - 488), static_cast<float>(sh - 76)};
+        const bool in_view = CheckCollisionPointRec(GetMousePosition(), viewport);
+
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_Q)) {
             break;
         }
+
+        if (in_view && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            editor.ctrl.looking = true;
+            DisableCursor();
+        }
+        if (editor.ctrl.looking && IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
+            editor.ctrl.looking = false;
+            EnableCursor();
+        }
+        if (editor.ctrl.looking || editor.ctrl.possessed != nullptr) {
+            editor.ctrl.look();
+        }
+
+        if (editor.ctrl.possessed != nullptr) {
+            drive_possessed(editor.ctrl, editor.world, dt);
+        } else {
+            fly(editor.ctrl, dt);
+        }
+        editor.ctrl.to_camera(camera);
+
+        const Ray mouse_ray = GetMouseRay(GetMousePosition(), camera);
+        const Vec3 origin = to_vec(mouse_ray.position);
+        const Vec3 dir = to_vec(mouse_ray.direction);
+        auto world_hit = raycast_world(editor.world, origin, dir, editor.ctrl.possessed);
+        auto ground_hit = raycast_ground(origin, dir);
+        std::optional<RayHit> place_hit = world_hit ? world_hit : ground_hit;
+
+        if (!editor.playing) {
+            if (IsKeyPressed(KEY_ONE)) {
+                editor.tool = Tool::Select;
+            }
+            if (IsKeyPressed(KEY_TWO)) {
+                editor.tool = Tool::Sphere;
+            }
+            if (IsKeyPressed(KEY_THREE)) {
+                editor.tool = Tool::Box;
+            }
+            if (IsKeyPressed(KEY_FOUR)) {
+                editor.tool = Tool::Floor;
+            }
+            if (IsKeyPressed(KEY_FIVE)) {
+                editor.tool = Tool::Wall;
+            }
+            if (IsKeyPressed(KEY_SIX)) {
+                editor.tool = Tool::Ramp;
+            }
+            if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) {
+                if (editor.selected != nullptr) {
+                    editor.remove_entity(editor.selected);
+                    editor.status = "Deleted object.";
+                }
+            }
+            if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_D) && editor.selected != nullptr) {
+                Entity* src = editor.find(editor.selected);
+                if (src != nullptr) {
+                    editor.brush_color = src->color;
+                    editor.place_dynamic = src->body->type == BodyType::Dynamic;
+                    if (src->kind == Kind::Sphere) {
+                        editor.sphere_r = src->body->shape.radius;
+                    } else {
+                        editor.box_half = src->body->shape.half_extents;
+                    }
+                    Body* copy = editor.spawn(src->kind, src->body->position + Vec3{1.0f, 0.0f, 0.0f},
+                                              {0.0f, 1.0f, 0.0f});
+                    if (copy != nullptr) {
+                        copy->orientation = src->body->orientation;
+                    }
+                    editor.status = "Duplicated.";
+                }
+            }
+            if (in_view && !ui.hovered && GetMouseWheelMove() != 0.0f) {
+                const float s = GetMouseWheelMove() > 0.0f ? 1.08f : 1.0f / 1.08f;
+                editor.sphere_r = std::clamp(editor.sphere_r * s, 0.15f, 6.0f);
+                editor.box_half = editor.box_half * s;
+                editor.floor_half.x = std::clamp(editor.floor_half.x * s, 0.5f, 30.0f);
+                editor.floor_half.z = std::clamp(editor.floor_half.z * s, 0.5f, 30.0f);
+                editor.wall_half.y = std::clamp(editor.wall_half.y * s, 0.3f, 12.0f);
+                editor.wall_half.z = std::clamp(editor.wall_half.z * s, 0.5f, 20.0f);
+                editor.ramp_half = editor.ramp_half * s;
+            }
+        }
+
+        if (IsKeyPressed(KEY_P)) {
+            if (editor.playing) {
+                editor.stop_play();
+            } else {
+                editor.begin_play();
+            }
+        }
         if (IsKeyPressed(KEY_ESCAPE)) {
-            if (ctrl.possessed != nullptr) {
-                ctrl.release();
+            if (editor.ctrl.possessed != nullptr) {
+                editor.ctrl.release();
+            } else if (editor.playing) {
+                editor.stop_play();
+            } else {
+                editor.selected = nullptr;
             }
         }
-        if (IsKeyPressed(KEY_R)) {
-            ctrl.release();
-            ctrl.last_placed = nullptr;
-            populate(world);
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_S)) {
+            editor.save(kSavePath);
+        }
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_O)) {
+            editor.load(kSavePath);
+        }
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_N)) {
+            editor.new_world();
         }
 
-        const Vec3 origin = to_vec(ctrl.eye);
-        const Vec3 dir = ctrl.forward();
-        const auto look_hit = raycast(world, origin, dir, ctrl.possessed);
-
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsKeyPressed(KEY_ONE)) {
-            ctrl.last_placed = spawn_sphere(world, placement_point(ctrl, look_hit));
-        }
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || IsKeyPressed(KEY_TWO)) {
-            ctrl.last_placed = spawn_box(world, placement_point(ctrl, look_hit));
+        if (editor.playing && editor.ctrl.possessed == nullptr && IsKeyPressed(KEY_F) && world_hit &&
+            world_hit->body != nullptr) {
+            editor.ctrl.possess(world_hit->body);
         }
 
-        if (IsKeyPressed(KEY_F)) {
-            Body* target = nullptr;
-            if (look_hit && look_hit->body->type == BodyType::Dynamic) {
-                target = look_hit->body;
-            } else if (ctrl.last_placed != nullptr && ctrl.last_placed->type == BodyType::Dynamic) {
-                target = ctrl.last_placed;
+        if (!editor.playing && in_view && !ui.hovered && !editor.ctrl.looking) {
+            if (editor.tool == Tool::Select) {
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    editor.selected = world_hit ? world_hit->body : nullptr;
+                    if (editor.selected != nullptr) {
+                        editor.dragging = editor.selected;
+                        editor.drag_y = editor.selected->position.y;
+                    }
+                }
+                if (editor.dragging != nullptr && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                    if (std::abs(dir.y) > 1e-5f) {
+                        const float t = (editor.drag_y - origin.y) / dir.y;
+                        if (t > 0.0f) {
+                            Vec3 p = origin + dir * t;
+                            if (editor.grid_snap) {
+                                p = snap_vec(p, editor.snap);
+                                p.y = editor.drag_y;
+                            }
+                            editor.dragging->position = p;
+                            editor.dragging->prev_position = p;
+                            editor.dragging->velocity = {};
+                        }
+                    }
+                }
+                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                    editor.dragging = nullptr;
+                }
+            } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && place_hit) {
+                editor.spawn(kind_from_tool(editor.tool), place_hit->point, place_hit->normal);
+                editor.status = "Placed object.";
             }
-            if (target != nullptr) {
-                if (ctrl.possessed == target) {
-                    ctrl.release();
-                } else {
-                    ctrl.possess(target);
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            editor.dragging = nullptr;
+        }
+
+        if (editor.playing) {
+            editor.world.step(dt);
+            if (editor.ctrl.possessed != nullptr) {
+                editor.ctrl.eye = to_rl(editor.ctrl.possessed->position);
+                editor.ctrl.to_camera(camera);
+            }
+        }
+
+        BeginDrawing();
+        ClearBackground({14, 16, 22, 255});
+
+        BeginMode3D(camera);
+        DrawGrid(48, 1.0f);
+        for (const auto& e : editor.entities) {
+            if (e.body == editor.ctrl.possessed) {
+                continue;
+            }
+            Color c = e.color;
+            if (e.body == editor.selected) {
+                c = Color{255, 224, 130, 255};
+            } else if (world_hit && world_hit->body == e.body) {
+                c.r = static_cast<unsigned char>(std::min(255, c.r + 40));
+                c.g = static_cast<unsigned char>(std::min(255, c.g + 40));
+                c.b = static_cast<unsigned char>(std::min(255, c.b + 40));
+            }
+            draw_body(*e.body, c);
+        }
+
+        if (!editor.playing && editor.tool != Tool::Select && in_view && place_hit && !ui.hovered) {
+            Body ghost;
+            ghost.position = place_hit->point;
+            ghost.orientation = Quat::identity();
+            const Vec3 n = place_hit->normal;
+            Color gc = ColorAlpha(editor.brush_color, 120);
+            switch (editor.tool) {
+                case Tool::Sphere:
+                    ghost.shape = physics::Shape::sphere(editor.sphere_r);
+                    ghost.position += n * editor.sphere_r;
+                    break;
+                case Tool::Box:
+                    ghost.shape = physics::Shape::box(editor.box_half);
+                    ghost.position += n * editor.box_half.y;
+                    break;
+                case Tool::Floor:
+                    ghost.shape = physics::Shape::box(editor.floor_half);
+                    ghost.position.y += editor.floor_half.y;
+                    break;
+                case Tool::Wall:
+                    ghost.shape = physics::Shape::box(editor.wall_half);
+                    ghost.position += n * editor.wall_half.x;
+                    ghost.position.y += editor.wall_half.y;
+                    ghost.orientation = editor.wall_orientation();
+                    break;
+                case Tool::Ramp:
+                    ghost.shape = physics::Shape::box(editor.ramp_half);
+                    ghost.position.y += editor.ramp_half.y + 0.8f;
+                    ghost.orientation = Quat::from_axis_angle({0.0f, 0.0f, 1.0f}, -editor.ramp_angle) *
+                                        Quat::from_axis_angle({0.0f, 1.0f, 0.0f}, editor.ctrl.yaw);
+                    break;
+                default:
+                    break;
+            }
+            if (editor.grid_snap) {
+                ghost.position = snap_vec(ghost.position, editor.snap);
+            }
+            draw_body(ghost, gc);
+        }
+        EndMode3D();
+
+        ui::panel(top, {18, 20, 28, 245});
+        ui::panel(left, {16, 18, 26, 240});
+        ui::panel(right, {16, 18, 26, 240});
+        ui::panel(bottom, {12, 14, 20, 255});
+
+        ui::label(16, 14, "World Builder", RAYWHITE, 22);
+        if (ui::button(ui, {210, 10, 88, 28}, "New")) {
+            editor.new_world();
+        }
+        if (ui::button(ui, {306, 10, 88, 28}, "Save")) {
+            editor.save(kSavePath);
+        }
+        if (ui::button(ui, {402, 10, 88, 28}, "Load")) {
+            editor.load(kSavePath);
+        }
+        if (ui::button(ui, {514, 10, 110, 28}, editor.playing ? "Stop" : "Play", editor.playing)) {
+            if (editor.playing) {
+                editor.stop_play();
+            } else {
+                editor.begin_play();
+            }
+        }
+        editor.grid_snap = ui::toggle(ui, {640, 10, 110, 28}, editor.grid_snap ? "Snap on" : "Snap off", editor.grid_snap);
+
+        ui::label(16, 60, "TOOLS", GRAY, 14);
+        float ty = 84;
+        auto tool_btn = [&](Tool t, const char* name, const char* key) {
+            char label[48];
+            std::snprintf(label, sizeof(label), "%s  %s", key, name);
+            if (ui::button(ui, {14, ty, 160, 34}, label, editor.tool == t)) {
+                editor.tool = t;
+            }
+            ty += 40;
+        };
+        tool_btn(Tool::Select, "Select", "1");
+        tool_btn(Tool::Sphere, "Sphere", "2");
+        tool_btn(Tool::Box, "Box", "3");
+        tool_btn(Tool::Floor, "Floor", "4");
+        tool_btn(Tool::Wall, "Wall", "5");
+        tool_btn(Tool::Ramp, "Ramp", "6");
+
+        ty += 8;
+        ui::label(16, static_cast<int>(ty), "BRUSH", GRAY, 14);
+        ty += 24;
+        if (editor.tool == Tool::Sphere || editor.tool == Tool::Box) {
+            editor.place_dynamic =
+                ui::toggle(ui, {14, ty, 160, 30}, editor.place_dynamic ? "Dynamic" : "Static", editor.place_dynamic);
+            ty += 44;
+        }
+        if (editor.tool == Tool::Sphere) {
+            editor.sphere_r = ui::slider(ui, {14, ty + 16, 160, 16}, editor.sphere_r, 0.15f, 4.0f, "Radius");
+            ty += 50;
+        } else if (editor.tool == Tool::Box) {
+            editor.box_half.x = ui::slider(ui, {14, ty + 16, 160, 16}, editor.box_half.x, 0.15f, 6.0f, "Width");
+            editor.box_half.y = ui::slider(ui, {14, ty + 56, 160, 16}, editor.box_half.y, 0.15f, 6.0f, "Height");
+            editor.box_half.z = ui::slider(ui, {14, ty + 96, 160, 16}, editor.box_half.z, 0.15f, 6.0f, "Depth");
+            ty += 130;
+        } else if (editor.tool == Tool::Floor) {
+            editor.floor_half.x = ui::slider(ui, {14, ty + 16, 160, 16}, editor.floor_half.x, 1.0f, 20.0f, "Width");
+            editor.floor_half.z = ui::slider(ui, {14, ty + 56, 160, 16}, editor.floor_half.z, 1.0f, 20.0f, "Depth");
+            ty += 90;
+        } else if (editor.tool == Tool::Wall) {
+            editor.wall_half.y = ui::slider(ui, {14, ty + 16, 160, 16}, editor.wall_half.y, 0.4f, 8.0f, "Height");
+            editor.wall_half.z = ui::slider(ui, {14, ty + 56, 160, 16}, editor.wall_half.z, 0.5f, 12.0f, "Width");
+            ty += 90;
+        } else if (editor.tool == Tool::Ramp) {
+            editor.ramp_angle = ui::slider(ui, {14, ty + 16, 160, 16}, editor.ramp_angle, 0.1f, 0.8f, "Angle");
+            ty += 50;
+        }
+
+        ui::label(16, static_cast<int>(ty + 8), "COLOR", GRAY, 14);
+        ty += 28;
+        for (int i = 0; i < 8; ++i) {
+            const float x = 14.0f + static_cast<float>(i % 4) * 40.0f;
+            const float y = ty + static_cast<float>(i / 4) * 36.0f;
+            const Rectangle sw{x, y, 34, 28};
+            ui.mark(sw);
+            DrawRectangleRec(sw, kPalette[i]);
+            if (editor.brush_color.r == kPalette[i].r && editor.brush_color.g == kPalette[i].g &&
+                editor.brush_color.b == kPalette[i].b) {
+                DrawRectangleLinesEx(sw, 2, RAYWHITE);
+            }
+            if (ui.over(sw) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                editor.brush_color = kPalette[i];
+                ui.used = true;
+                if (editor.selected != nullptr) {
+                    if (Entity* e = editor.find(editor.selected)) {
+                        e->color = kPalette[i];
+                    }
                 }
             }
         }
 
-        if (ctrl.possessed != nullptr) {
-            drive_possessed(ctrl, world, dt);
+        ui::label(static_cast<int>(right.x + 16), 60, "INSPECTOR", GRAY, 14);
+        Entity* sel = editor.find(editor.selected);
+        if (sel == nullptr) {
+            ui::label(static_cast<int>(right.x + 16), 96, "Click an object to edit it.", DARKGRAY, 16);
+            ui::label(static_cast<int>(right.x + 16), 124, "Or choose a tool and click", DARKGRAY, 16);
+            ui::label(static_cast<int>(right.x + 16), 144, "in the viewport to place.", DARKGRAY, 16);
         } else {
-            fly_spectator(ctrl, dt);
-        }
-
-        world.step(dt);
-
-        if (ctrl.possessed != nullptr) {
-            ctrl.eye = to_rl(ctrl.possessed->position);
-        }
-        ctrl.to_camera(camera);
-
-        BeginDrawing();
-        ClearBackground({16, 18, 24, 255});
-
-        BeginMode3D(camera);
-        DrawGrid(24, 1.0f);
-        std::size_t index = 0;
-        for (const auto& body : world.bodies()) {
-            if (body.get() == ctrl.possessed) {
-                ++index;
-                continue;
+            Body& b = *sel->body;
+            ui::label(static_cast<int>(right.x + 16), 88, sel->name, RAYWHITE, 20);
+            const char* kind_name = "Object";
+            if (sel->kind == Kind::Sphere) {
+                kind_name = "Sphere";
+            } else if (sel->kind == Kind::Box) {
+                kind_name = "Box";
+            } else if (sel->kind == Kind::Floor) {
+                kind_name = "Floor plane";
+            } else if (sel->kind == Kind::Wall) {
+                kind_name = "Wall plane";
+            } else if (sel->kind == Kind::Ramp) {
+                kind_name = "Ramp";
             }
-            const bool hovered = look_hit && look_hit->body == body.get();
-            draw_body(*body, color_for(index++, *body, hovered));
+            ui::label(static_cast<int>(right.x + 16), 112, kind_name, GRAY, 16);
+
+            const float rx = right.x + 16;
+            bool is_dyn = b.type == BodyType::Dynamic;
+            const bool want_dyn = ui::toggle(ui, {rx, 140, 268, 30}, is_dyn ? "Dynamic body" : "Static body", is_dyn);
+            if (want_dyn != is_dyn) {
+                b.set_type(want_dyn ? BodyType::Dynamic : BodyType::Static);
+                if (want_dyn) {
+                    physics::compute_mass(b, sel->density);
+                }
+            }
+
+            b.position.x = ui::slider(ui, {rx, 196, 268, 16}, b.position.x, -24.0f, 24.0f, "Position X");
+            b.position.y = ui::slider(ui, {rx, 236, 268, 16}, b.position.y, -2.0f, 20.0f, "Position Y");
+            b.position.z = ui::slider(ui, {rx, 276, 268, 16}, b.position.z, -24.0f, 24.0f, "Position Z");
+            b.prev_position = b.position;
+
+            if (b.shape.type == ShapeType::Sphere) {
+                const float r = ui::slider(ui, {rx, 326, 268, 16}, b.shape.radius, 0.15f, 6.0f, "Radius");
+                if (r != b.shape.radius) {
+                    b.shape.radius = r;
+                    apply_shape(*sel);
+                }
+            } else {
+                const float hx = ui::slider(ui, {rx, 326, 268, 16}, b.shape.half_extents.x, 0.08f, 20.0f, "Half width");
+                const float hy = ui::slider(ui, {rx, 366, 268, 16}, b.shape.half_extents.y, 0.08f, 12.0f, "Half height");
+                const float hz = ui::slider(ui, {rx, 406, 268, 16}, b.shape.half_extents.z, 0.08f, 20.0f, "Half depth");
+                if (hx != b.shape.half_extents.x || hy != b.shape.half_extents.y || hz != b.shape.half_extents.z) {
+                    b.shape.half_extents = {hx, hy, hz};
+                    apply_shape(*sel);
+                }
+            }
+
+            b.restitution = ui::slider(ui, {rx, 456, 268, 16}, b.restitution, 0.0f, 1.0f, "Bounciness");
+            b.friction = ui::slider(ui, {rx, 496, 268, 16}, b.friction, 0.0f, 1.2f, "Friction");
+
+            if (ui::button(ui, {rx, 536, 128, 32}, "Duplicate")) {
+                editor.brush_color = sel->color;
+                Body* copy = editor.spawn(sel->kind, b.position + Vec3{1, 0, 0}, {0, 1, 0});
+                if (copy != nullptr) {
+                    copy->orientation = b.orientation;
+                }
+            }
+            if (ui::button(ui, {rx + 140, 536, 128, 32}, "Delete")) {
+                editor.remove_entity(sel->body);
+                sel = nullptr;
+            }
         }
-        EndMode3D();
 
-        const int cx = GetScreenWidth() / 2;
-        const int cy = GetScreenHeight() / 2;
-        DrawLine(cx - 8, cy, cx + 8, cy, RAYWHITE);
-        DrawLine(cx, cy - 8, cx, cy + 8, RAYWHITE);
-
-        DrawRectangle(12, 12, 560, 118, ColorAlpha({10, 12, 16, 255}, 0.72f));
-        DrawText(ctrl.possessed ? "Possessed  (first person)" : "Spectator  (fly)", 24, 22, 20, RAYWHITE);
-        DrawText("WASD move   mouse look   SPACE fly up/jump   Ctrl down   Shift sprint", 24, 48, 16, LIGHTGRAY);
-        DrawText("LMB / 1 sphere   RMB / 2 box   F become object   ESC leave body   Q quit", 24, 70, 16,
-                 LIGHTGRAY);
-
-        if (look_hit && look_hit->body->type == BodyType::Dynamic && ctrl.possessed == nullptr) {
-            DrawText("F  become this object", cx - 110, cy + 24, 18, {255, 224, 130, 255});
+        if (in_view && !editor.ctrl.looking && editor.ctrl.possessed == nullptr) {
+            const Vector2 m = GetMousePosition();
+            DrawLine(static_cast<int>(m.x) - 7, static_cast<int>(m.y), static_cast<int>(m.x) + 7, static_cast<int>(m.y),
+                     ColorAlpha(RAYWHITE, 0.7f));
+            DrawLine(static_cast<int>(m.x), static_cast<int>(m.y) - 7, static_cast<int>(m.x), static_cast<int>(m.y) + 7,
+                     ColorAlpha(RAYWHITE, 0.7f));
         }
 
-        char stats[160];
-        std::snprintf(stats, sizeof(stats), "bodies %zu   contacts %zu", world.bodies().size(),
-                      world.contacts().size());
-        DrawText(stats, 24, 96, 16, GRAY);
-        DrawFPS(GetScreenWidth() - 90, 16);
+        char stats[256];
+        std::snprintf(stats, sizeof(stats), "%s    |    objects %zu    |    WASD fly   RMB look   wheel scale   Del delete   P play   Ctrl+S save",
+                      editor.status.c_str(), editor.entities.size());
+        DrawText(stats, 12, sh - 22, 16, LIGHTGRAY);
+        DrawFPS(sw - 90, 14);
+        ui.end();
         EndDrawing();
     }
 

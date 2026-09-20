@@ -65,6 +65,10 @@ struct Body {
             }
         } else {
             inv_mass = mass > 0.0f ? 1.0f / mass : 0.0f;
+            auto inv_diag = [](float v) { return v > 1e-8f ? 1.0f / v : 0.0f; };
+            inv_inertia_local = Mat3::diagonal(inv_diag(inertia_local.c0.x),
+                                               inv_diag(inertia_local.c1.y),
+                                               inv_diag(inertia_local.c2.z));
         }
     }
 

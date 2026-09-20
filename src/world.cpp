@@ -142,6 +142,22 @@ void World::clear() {
     contacts_.clear();
 }
 
+bool World::destroy_body(Body* body) {
+    if (body == nullptr) {
+        return false;
+    }
+    const auto it = std::find_if(bodies_.begin(), bodies_.end(),
+                                 [body](const std::unique_ptr<Body>& owned) { return owned.get() == body; });
+    if (it == bodies_.end()) {
+        return false;
+    }
+    bodies_.erase(it);
+    contacts_.erase(std::remove_if(contacts_.begin(), contacts_.end(),
+                                   [body](const Contact& c) { return c.a == body || c.b == body; }),
+                    contacts_.end());
+    return true;
+}
+
 void World::integrate_velocities(float dt) {
     for (auto& body : bodies_) {
         if (body->type != BodyType::Dynamic) {
