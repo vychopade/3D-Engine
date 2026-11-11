@@ -6,6 +6,7 @@
 #include "rlgl.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -29,7 +30,67 @@ constexpr float kMouseSens = 0.0025f;
 constexpr float kFlySpeed = 14.0f;
 constexpr float kWalkSpeed = 7.0f;
 constexpr float kJumpSpeed = 6.5f;
-constexpr const char* kSavePath = "worlds/scene.world";
+
+std::filesystem::path worlds_directory() {
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (!ec) {
+        const auto in_cwd = cwd / "worlds";
+        if (std::filesystem::exists(in_cwd)) {
+            return in_cwd;
+        }
+        const auto sibling = cwd.parent_path() / "worlds";
+        if (std::filesystem::exists(sibling)) {
+            return sibling;
+        }
+    }
+    const auto exe_dir = std::filesystem::path(GetApplicationDirectory());
+    const auto next_to_project = exe_dir.parent_path() / "worlds";
+    if (std::filesystem::exists(next_to_project)) {
+        return next_to_project;
+    }
+    auto created = (ec ? exe_dir : cwd) / "worlds";
+    std::filesystem::create_directories(created, ec);
+    return created;
+}
+
+std::string sanitize_world_name(const char* raw) {
+    std::string out;
+    for (const char* p = raw; p != nullptr && *p != '\0'; ++p) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (std::isalnum(c) || c == '_' || c == '-') {
+            out.push_back(static_cast<char>(c));
+        } else if (c == ' ' && !out.empty() && out.back() != '_') {
+            out.push_back('_');
+        }
+    }
+    while (!out.empty() && out.back() == '_') {
+        out.pop_back();
+    }
+    if (out.empty()) {
+        out = "MyWorld";
+    }
+    return out;
+}
+
+std::vector<std::string> list_saved_worlds() {
+    std::vector<std::string> names;
+    std::error_code ec;
+    const auto dir = worlds_directory();
+    if (!std::filesystem::exists(dir, ec)) {
+        return names;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() == ".world") {
+            names.push_back(entry.path().stem().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
 
 const Color kPalette[] = {
     {239, 83, 80, 255},  {66, 165, 245, 255}, {102, 187, 106, 255}, {255, 167, 38, 255},
@@ -279,6 +340,13 @@ struct Editor {
     std::string status = "Place a floor, then add objects. Right-drag to look.";
     int counters[6]{};
 
+    char world_name[64]{"Untitled"};
+    bool save_dialog = false;
+    bool load_dialog = false;
+    bool name_focused = true;
+    std::vector<std::string> saved_worlds;
+    int load_scroll = 0;
+
     Color brush_color{66, 165, 245, 255};
     bool place_dynamic = true;
     float sphere_r = 0.5f;
@@ -418,10 +486,58 @@ struct Editor {
         return body;
     }
 
+    std::filesystem::path path_for_name(const char* name) const {
+        return worlds_directory() / (sanitize_world_name(name) + ".world");
+    }
+
+    void open_save_dialog() {
+        save_dialog = true;
+        load_dialog = false;
+        name_focused = true;
+        if (std::strlen(world_name) == 0) {
+            std::snprintf(world_name, sizeof(world_name), "MyWorld");
+        }
+    }
+
+    void open_load_dialog() {
+        load_dialog = true;
+        save_dialog = false;
+        name_focused = false;
+        saved_worlds = list_saved_worlds();
+        load_scroll = 0;
+        if (saved_worlds.empty()) {
+            status = "No saved worlds yet. Use Save and give your scene a name.";
+        }
+    }
+
+    bool save_current() {
+        const std::string stem = sanitize_world_name(world_name);
+        std::snprintf(world_name, sizeof(world_name), "%s", stem.c_str());
+        const auto path = path_for_name(world_name);
+        if (!save(path.string().c_str())) {
+            return false;
+        }
+        status = "Saved world \"" + stem + "\"";
+        save_dialog = false;
+        return true;
+    }
+
+    bool load_named(const std::string& stem) {
+        const auto path = path_for_name(stem.c_str());
+        if (!load(path.string().c_str())) {
+            return false;
+        }
+        std::snprintf(world_name, sizeof(world_name), "%s", stem.c_str());
+        load_dialog = false;
+        status = "Loaded world \"" + stem + "\"";
+        return true;
+    }
+
     void new_world() {
         clear_world();
         spawn(Kind::Floor, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
         selected = nullptr;
+        std::snprintf(world_name, sizeof(world_name), "Untitled");
         status = "New world. Use Floor / Wall / Ramp / Box / Sphere to build.";
     }
 
@@ -651,27 +767,30 @@ int main() {
         const Rectangle bottom{0, static_cast<float>(sh - 28), static_cast<float>(sw), 28};
         const Rectangle viewport{188, 48, static_cast<float>(sw - 488), static_cast<float>(sh - 76)};
         const bool in_view = CheckCollisionPointRec(GetMousePosition(), viewport);
+        const bool modal = editor.save_dialog || editor.load_dialog;
 
         if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_Q)) {
             break;
         }
 
-        if (in_view && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        if (!modal && in_view && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
             editor.ctrl.looking = true;
             DisableCursor();
         }
-        if (editor.ctrl.looking && IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)) {
+        if (editor.ctrl.looking && (IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) || modal)) {
             editor.ctrl.looking = false;
             EnableCursor();
         }
-        if (editor.ctrl.looking || editor.ctrl.possessed != nullptr) {
+        if (!modal && (editor.ctrl.looking || editor.ctrl.possessed != nullptr)) {
             editor.ctrl.look();
         }
 
-        if (editor.ctrl.possessed != nullptr) {
-            drive_possessed(editor.ctrl, editor.world, dt);
-        } else {
-            fly(editor.ctrl, dt);
+        if (!modal) {
+            if (editor.ctrl.possessed != nullptr) {
+                drive_possessed(editor.ctrl, editor.world, dt);
+            } else {
+                fly(editor.ctrl, dt);
+            }
         }
         editor.ctrl.to_camera(camera);
 
@@ -682,7 +801,7 @@ int main() {
         auto ground_hit = raycast_ground(origin, dir);
         std::optional<RayHit> place_hit = world_hit ? world_hit : ground_hit;
 
-        if (!editor.playing) {
+        if (!editor.playing && !modal) {
             if (IsKeyPressed(KEY_ONE)) {
                 editor.tool = Tool::Select;
             }
@@ -737,7 +856,7 @@ int main() {
             }
         }
 
-        if (IsKeyPressed(KEY_P)) {
+        if (!modal && IsKeyPressed(KEY_P)) {
             if (editor.playing) {
                 editor.stop_play();
             } else {
@@ -745,7 +864,10 @@ int main() {
             }
         }
         if (IsKeyPressed(KEY_ESCAPE)) {
-            if (editor.ctrl.possessed != nullptr) {
+            if (editor.save_dialog || editor.load_dialog) {
+                editor.save_dialog = false;
+                editor.load_dialog = false;
+            } else if (editor.ctrl.possessed != nullptr) {
                 editor.ctrl.release();
             } else if (editor.playing) {
                 editor.stop_play();
@@ -754,10 +876,15 @@ int main() {
             }
         }
         if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_S)) {
-            editor.save(kSavePath);
+            const std::string stem = sanitize_world_name(editor.world_name);
+            if (stem == "Untitled") {
+                editor.open_save_dialog();
+            } else {
+                editor.save_current();
+            }
         }
         if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_O)) {
-            editor.load(kSavePath);
+            editor.open_load_dialog();
         }
         if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_N)) {
             editor.new_world();
@@ -768,7 +895,7 @@ int main() {
             editor.ctrl.possess(world_hit->body);
         }
 
-        if (!editor.playing && in_view && !ui.hovered && !editor.ctrl.looking) {
+        if (!modal && !editor.playing && in_view && !ui.hovered && !editor.ctrl.looking) {
             if (editor.tool == Tool::Select) {
                 if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     editor.selected = world_hit ? world_hit->body : nullptr;
@@ -873,29 +1000,33 @@ int main() {
         }
         EndMode3D();
 
+        ui.absorb = modal;
         ui::panel(top, {18, 20, 28, 245});
         ui::panel(left, {16, 18, 26, 240});
         ui::panel(right, {16, 18, 26, 240});
         ui::panel(bottom, {12, 14, 20, 255});
 
-        ui::label(16, 14, "World Builder", RAYWHITE, 22);
-        if (ui::button(ui, {210, 10, 88, 28}, "New")) {
+        char title[96];
+        std::snprintf(title, sizeof(title), "World Builder  —  %s", editor.world_name);
+        ui::label(16, 14, title, RAYWHITE, 22);
+        if (ui::button(ui, {268, 10, 80, 28}, "New")) {
             editor.new_world();
         }
-        if (ui::button(ui, {306, 10, 88, 28}, "Save")) {
-            editor.save(kSavePath);
+        if (ui::button(ui, {356, 10, 80, 28}, "Save")) {
+            editor.open_save_dialog();
         }
-        if (ui::button(ui, {402, 10, 88, 28}, "Load")) {
-            editor.load(kSavePath);
+        if (ui::button(ui, {444, 10, 80, 28}, "Load")) {
+            editor.open_load_dialog();
         }
-        if (ui::button(ui, {514, 10, 110, 28}, editor.playing ? "Stop" : "Play", editor.playing)) {
+        if (ui::button(ui, {540, 10, 100, 28}, editor.playing ? "Stop" : "Play", editor.playing)) {
             if (editor.playing) {
                 editor.stop_play();
             } else {
                 editor.begin_play();
             }
         }
-        editor.grid_snap = ui::toggle(ui, {640, 10, 110, 28}, editor.grid_snap ? "Snap on" : "Snap off", editor.grid_snap);
+        editor.grid_snap =
+            ui::toggle(ui, {650, 10, 100, 28}, editor.grid_snap ? "Snap on" : "Snap off", editor.grid_snap);
 
         ui::label(16, 60, "TOOLS", GRAY, 14);
         float ty = 84;
@@ -955,7 +1086,7 @@ int main() {
                 editor.brush_color.b == kPalette[i].b) {
                 DrawRectangleLinesEx(sw, 2, RAYWHITE);
             }
-            if (ui.over(sw) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            if (!ui.absorb && ui.over(sw) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 editor.brush_color = kPalette[i];
                 ui.used = true;
                 if (editor.selected != nullptr) {
@@ -1036,7 +1167,70 @@ int main() {
             }
         }
 
-        if (in_view && !editor.ctrl.looking && editor.ctrl.possessed == nullptr) {
+        ui.absorb = false;
+        if (editor.save_dialog) {
+            DrawRectangle(0, 0, sw, sh, Color{0, 0, 0, 140});
+            const Rectangle box{static_cast<float>(sw) * 0.5f - 220.0f, static_cast<float>(sh) * 0.5f - 110.0f, 440, 220};
+            ui.mark(box);
+            ui::panel(box, {24, 26, 36, 255});
+            ui::label(static_cast<int>(box.x) + 24, static_cast<int>(box.y) + 20, "Save world", RAYWHITE, 22);
+            ui::label(static_cast<int>(box.x) + 24, static_cast<int>(box.y) + 52, "Name this scene to keep it.", GRAY, 16);
+            ui::text_field(ui, {box.x + 24, box.y + 88, 392, 36}, editor.world_name, static_cast<int>(sizeof(editor.world_name)),
+                           editor.name_focused);
+            if (ui::button(ui, {box.x + 24, box.y + 148, 180, 36}, "Save")) {
+                editor.save_current();
+            }
+            if (ui::button(ui, {box.x + 216, box.y + 148, 180, 36}, "Cancel")) {
+                editor.save_dialog = false;
+            }
+            if (IsKeyPressed(KEY_ENTER)) {
+                editor.save_current();
+            }
+        }
+
+        if (editor.load_dialog) {
+            DrawRectangle(0, 0, sw, sh, Color{0, 0, 0, 140});
+            const Rectangle box{static_cast<float>(sw) * 0.5f - 230.0f, static_cast<float>(sh) * 0.5f - 200.0f, 460, 400};
+            ui.mark(box);
+            ui::panel(box, {24, 26, 36, 255});
+            ui::label(static_cast<int>(box.x) + 24, static_cast<int>(box.y) + 20, "Load world", RAYWHITE, 22);
+
+            const int visible = 7;
+            if (ui.over(box) && GetMouseWheelMove() != 0.0f) {
+                editor.load_scroll -= static_cast<int>(GetMouseWheelMove());
+            }
+            const int max_scroll =
+                std::max(0, static_cast<int>(editor.saved_worlds.size()) - visible);
+            editor.load_scroll = std::clamp(editor.load_scroll, 0, max_scroll);
+
+            float y = box.y + 60;
+            if (editor.saved_worlds.empty()) {
+                ui::label(static_cast<int>(box.x) + 24, static_cast<int>(y), "No saved worlds yet.", DARKGRAY, 16);
+            }
+            for (int i = 0; i < visible; ++i) {
+                const int idx = editor.load_scroll + i;
+                if (idx >= static_cast<int>(editor.saved_worlds.size())) {
+                    break;
+                }
+                const auto& name = editor.saved_worlds[static_cast<std::size_t>(idx)];
+                if (ui::button(ui, {box.x + 24, y, 300, 32}, name.c_str())) {
+                    editor.load_named(name);
+                }
+                if (ui::button(ui, {box.x + 332, y, 104, 32}, "Delete")) {
+                    std::error_code ec;
+                    std::filesystem::remove(editor.path_for_name(name.c_str()), ec);
+                    editor.saved_worlds = list_saved_worlds();
+                    editor.status = "Deleted saved world \"" + name + "\"";
+                }
+                y += 38;
+            }
+
+            if (ui::button(ui, {box.x + 24, box.y + 348, 412, 36}, "Cancel")) {
+                editor.load_dialog = false;
+            }
+        }
+
+        if (in_view && !editor.ctrl.looking && editor.ctrl.possessed == nullptr && !modal) {
             const Vector2 m = GetMousePosition();
             DrawLine(static_cast<int>(m.x) - 7, static_cast<int>(m.y), static_cast<int>(m.x) + 7, static_cast<int>(m.y),
                      ColorAlpha(RAYWHITE, 0.7f));
@@ -1045,7 +1239,8 @@ int main() {
         }
 
         char stats[256];
-        std::snprintf(stats, sizeof(stats), "%s    |    objects %zu    |    WASD fly   RMB look   wheel scale   Del delete   P play   Ctrl+S save",
+        std::snprintf(stats, sizeof(stats),
+                      "%s    |    objects %zu    |    Ctrl+S save   Ctrl+O load   WASD fly   RMB look",
                       editor.status.c_str(), editor.entities.size());
         DrawText(stats, 12, sh - 22, 16, LIGHTGRAY);
         DrawFPS(sw - 90, 14);
