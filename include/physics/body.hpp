@@ -4,6 +4,9 @@
 #include "physics/quat.hpp"
 #include "physics/vec3.hpp"
 
+#include <algorithm>
+#include <cmath>
+
 namespace physics {
 
 enum class BodyType { Dynamic, Static, Kinematic };
@@ -94,6 +97,60 @@ struct Body {
     Vec3 y_axis() const { return rotation() * Vec3{0.0f, 1.0f, 0.0f}; }
     Vec3 z_axis() const { return rotation() * Vec3{0.0f, 0.0f, 1.0f}; }
 };
+
+inline float body_volume(const Body& body) {
+    if (body.shape.type == ShapeType::Sphere) {
+        const float r = body.shape.radius;
+        return (4.0f / 3.0f) * 3.14159265f * r * r * r;
+    }
+    const Vec3 h = body.shape.half_extents;
+    return 8.0f * h.x * h.y * h.z;
+}
+
+inline void apply_inertia_from_mass(Body& body) {
+    const float m = std::max(body.mass, 1e-6f);
+    if (body.shape.type == ShapeType::Sphere) {
+        const float r = body.shape.radius;
+        const float i = 0.4f * m * r * r;
+        body.inertia_local = Mat3::diagonal(i, i, i);
+    } else {
+        const Vec3 h = body.shape.half_extents;
+        const float ixx = (m / 3.0f) * (h.y * h.y + h.z * h.z);
+        const float iyy = (m / 3.0f) * (h.x * h.x + h.z * h.z);
+        const float izz = (m / 3.0f) * (h.x * h.x + h.y * h.y);
+        body.inertia_local = Mat3::diagonal(ixx, iyy, izz);
+    }
+    body.set_mass(m);
+    if (body.type != BodyType::Dynamic) {
+        body.inv_mass = 0.0f;
+        body.inv_inertia_local = Mat3::zero();
+        return;
+    }
+    auto inv_diag = [](float v) { return v > 1e-8f ? 1.0f / v : 0.0f; };
+    body.inv_inertia_local = Mat3::diagonal(inv_diag(body.inertia_local.c0.x),
+                                            inv_diag(body.inertia_local.c1.y),
+                                            inv_diag(body.inertia_local.c2.z));
+}
+
+inline void set_body_mass(Body& body, float mass) {
+    body.mass = std::max(mass, 1e-4f);
+    apply_inertia_from_mass(body);
+}
+
+inline void set_body_volume(Body& body, float volume) {
+    const float cur = std::max(body_volume(body), 1e-8f);
+    const float target = std::max(volume, 1e-5f);
+    const float scale = std::cbrt(target / cur);
+    if (body.shape.type == ShapeType::Sphere) {
+        body.shape.radius = std::max(body.shape.radius * scale, 0.05f);
+    } else {
+        body.shape.half_extents = body.shape.half_extents * scale;
+        body.shape.half_extents.x = std::max(body.shape.half_extents.x, 0.05f);
+        body.shape.half_extents.y = std::max(body.shape.half_extents.y, 0.05f);
+        body.shape.half_extents.z = std::max(body.shape.half_extents.z, 0.05f);
+    }
+    apply_inertia_from_mass(body);
+}
 
 inline void compute_mass(Body& body, float density) {
     if (body.shape.type == ShapeType::Sphere) {

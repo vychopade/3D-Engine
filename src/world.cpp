@@ -137,8 +137,45 @@ Body* World::add_box(Vec3 position, Vec3 half_extents, float density, BodyType t
     return ptr;
 }
 
+Spring* World::add_spring(Body* a, Body* b, Vec3 local_a, Vec3 local_b, float rest_length,
+                          float stiffness, float damping, bool bungee) {
+    if (a == nullptr) {
+        return nullptr;
+    }
+    auto spring = std::make_unique<Spring>();
+    spring->a = a;
+    spring->b = b;
+    spring->local_a = local_a;
+    spring->local_b = local_b;
+    spring->rest_length = std::max(rest_length, 0.0f);
+    spring->stiffness = std::max(stiffness, 0.0f);
+    spring->damping = std::max(damping, 0.0f);
+    spring->bungee = bungee;
+    Spring* ptr = spring.get();
+    springs_.push_back(std::move(spring));
+    return ptr;
+}
+
+DistanceJoint* World::add_rod(Body* a, Body* b, Vec3 local_a, Vec3 local_b, float length, bool pendulum) {
+    if (a == nullptr) {
+        return nullptr;
+    }
+    auto rod = std::make_unique<DistanceJoint>();
+    rod->a = a;
+    rod->b = b;
+    rod->local_a = local_a;
+    rod->local_b = local_b;
+    rod->length = std::max(length, 0.05f);
+    rod->pendulum = pendulum;
+    DistanceJoint* ptr = rod.get();
+    rods_.push_back(std::move(rod));
+    return ptr;
+}
+
 void World::clear() {
     bodies_.clear();
+    springs_.clear();
+    rods_.clear();
     contacts_.clear();
 }
 
@@ -152,10 +189,151 @@ bool World::destroy_body(Body* body) {
         return false;
     }
     bodies_.erase(it);
+    springs_.erase(std::remove_if(springs_.begin(), springs_.end(),
+                                  [body](const std::unique_ptr<Spring>& s) {
+                                      return s->a == body || s->b == body;
+                                  }),
+                   springs_.end());
+    rods_.erase(std::remove_if(rods_.begin(), rods_.end(),
+                               [body](const std::unique_ptr<DistanceJoint>& j) {
+                                   return j->a == body || j->b == body;
+                               }),
+                rods_.end());
     contacts_.erase(std::remove_if(contacts_.begin(), contacts_.end(),
                                    [body](const Contact& c) { return c.a == body || c.b == body; }),
                     contacts_.end());
     return true;
+}
+
+bool World::destroy_spring(Spring* spring) {
+    if (spring == nullptr) {
+        return false;
+    }
+    const auto it = std::find_if(springs_.begin(), springs_.end(),
+                                 [spring](const std::unique_ptr<Spring>& owned) { return owned.get() == spring; });
+    if (it == springs_.end()) {
+        return false;
+    }
+    springs_.erase(it);
+    return true;
+}
+
+bool World::destroy_rod(DistanceJoint* rod) {
+    if (rod == nullptr) {
+        return false;
+    }
+    const auto it = std::find_if(rods_.begin(), rods_.end(),
+                                 [rod](const std::unique_ptr<DistanceJoint>& owned) { return owned.get() == rod; });
+    if (it == rods_.end()) {
+        return false;
+    }
+    rods_.erase(it);
+    return true;
+}
+
+void World::solve_rods_velocity(float dt) {
+    for (auto& owned : rods_) {
+        DistanceJoint& j = *owned;
+        if (j.a == nullptr) {
+            continue;
+        }
+        const Vec3 pa = j.point_a();
+        const Vec3 pb = j.point_b();
+        Vec3 delta = pb - pa;
+        const float length = delta.length();
+        if (length < 1e-6f) {
+            continue;
+        }
+        const Vec3 n = delta / length;
+        const Vec3 ra = pa - j.a->position;
+        Vec3 rb{};
+        Vec3 va = j.a->velocity + cross(j.a->angular_velocity, ra);
+        Vec3 vb{};
+        float inv_mass = j.a->inv_mass + angular_effective_mass(*j.a, ra, n);
+        if (j.b != nullptr) {
+            rb = pb - j.b->position;
+            vb = j.b->velocity + cross(j.b->angular_velocity, rb);
+            inv_mass += j.b->inv_mass + angular_effective_mass(*j.b, rb, n);
+        }
+        if (inv_mass <= 1e-8f) {
+            continue;
+        }
+        const float cdot = dot(vb - va, n);
+        const float c = length - j.length;
+        const float bias = std::clamp(0.08f * c / std::max(dt, 1e-5f), -1.5f, 1.5f);
+        const float lambda = std::clamp(-(cdot + bias) / (inv_mass + 0.08f), -25.0f, 25.0f);
+        const Vec3 impulse = n * lambda;
+        j.a->apply_impulse(-impulse, ra);
+        if (j.b != nullptr) {
+            j.b->apply_impulse(impulse, rb);
+        }
+    }
+}
+
+void World::solve_rods_position() {
+    for (auto& owned : rods_) {
+        DistanceJoint& j = *owned;
+        if (j.a == nullptr) {
+            continue;
+        }
+        const Vec3 pa = j.point_a();
+        const Vec3 pb = j.point_b();
+        Vec3 delta = pb - pa;
+        const float length = delta.length();
+        if (length < 1e-6f) {
+            continue;
+        }
+        const Vec3 n = delta / length;
+        const float c = length - j.length;
+        const float inv_mass = j.a->inv_mass + (j.b != nullptr ? j.b->inv_mass : 0.0f);
+        if (inv_mass <= 1e-8f) {
+            continue;
+        }
+        // n points from a toward b. Positive length error means pull a along +n.
+        const Vec3 correction = n * (c * 0.85f);
+        j.a->position += correction * (j.a->inv_mass / inv_mass);
+        if (j.b != nullptr) {
+            j.b->position -= correction * (j.b->inv_mass / inv_mass);
+        }
+    }
+}
+
+void World::apply_springs() {
+    constexpr float kMaxForce = 2500.0f;
+    for (auto& owned : springs_) {
+        Spring& s = *owned;
+        if (s.a == nullptr) {
+            continue;
+        }
+        const Vec3 pa = s.point_a();
+        const Vec3 pb = s.point_b();
+        Vec3 delta = pb - pa;
+        const float length = delta.length();
+        if (length < 1e-6f) {
+            continue;
+        }
+        const Vec3 n = delta / length;
+        const float extension = length - s.rest_length;
+        if (s.bungee && extension < 0.0f) {
+            continue;
+        }
+
+        const Vec3 ra = pa - s.a->position;
+        Vec3 va = s.a->velocity + cross(s.a->angular_velocity, ra);
+        Vec3 vb{};
+        if (s.b != nullptr) {
+            const Vec3 rb = pb - s.b->position;
+            vb = s.b->velocity + cross(s.b->angular_velocity, rb);
+        }
+        const float closing = dot(vb - va, n);
+        float mag = s.stiffness * extension + s.damping * closing;
+        mag = std::clamp(mag, -kMaxForce, kMaxForce);
+        const Vec3 force = n * mag;
+        s.a->apply_force_at(force, pa);
+        if (s.b != nullptr) {
+            s.b->apply_force_at(-force, pb);
+        }
+    }
 }
 
 void World::integrate_velocities(float dt) {
@@ -250,6 +428,9 @@ void World::solve_velocities(float dt) {
             resolve_velocity(c, dt);
         }
     }
+    for (int i = 0; i < velocity_iterations; ++i) {
+        solve_rods_velocity(dt);
+    }
 }
 
 void World::solve_positions() {
@@ -258,10 +439,12 @@ void World::solve_positions() {
         for (Contact& c : contacts_) {
             resolve_position(c);
         }
+        solve_rods_position();
     }
 }
 
 void World::step_once(float dt) {
+    apply_springs();
     integrate_velocities(dt);
     find_contacts();
     solve_velocities(dt);

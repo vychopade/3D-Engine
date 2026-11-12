@@ -5,5 +5,7 @@
 #include "physics/contact.hpp"
 #include "physics/mat3.hpp"
 #include "physics/quat.hpp"
+#include "physics/joint.hpp"
+#include "physics/spring.hpp"
 #include "physics/vec3.hpp"
 #include "physics/world.hpp"

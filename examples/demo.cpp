@@ -19,8 +19,10 @@
 
 using physics::Body;
 using physics::BodyType;
+using physics::DistanceJoint;
 using physics::Quat;
 using physics::ShapeType;
+using physics::Spring;
 using physics::Vec3;
 using physics::World;
 
@@ -109,7 +111,7 @@ float snap_value(float v, float step) {
 
 Vec3 snap_vec(Vec3 v, float step) { return {snap_value(v.x, step), snap_value(v.y, step), snap_value(v.z, step)}; }
 
-enum class Tool { Select, Sphere, Box, Floor, Wall, Ramp };
+enum class Tool { Select, Sphere, Box, Floor, Wall, Ramp, Spring, Pendulum };
 enum class Kind { Sphere, Box, Floor, Wall, Ramp };
 
 struct Entity {
@@ -248,6 +250,96 @@ std::optional<RayHit> raycast_ground(Vec3 origin, Vec3 dir) {
     return RayHit{nullptr, t, origin + dir * t, {0.0f, 1.0f, 0.0f}};
 }
 
+void draw_spring(const Spring& spring, Color color) {
+    const Vec3 a = spring.point_a();
+    const Vec3 b = spring.point_b();
+    Vec3 delta = b - a;
+    const float len = delta.length();
+    if (len < 1e-4f) {
+        return;
+    }
+    const Vec3 n = delta / len;
+    Vec3 side = physics::cross(n, {0.0f, 1.0f, 0.0f});
+    if (side.length_sq() < 0.01f) {
+        side = physics::cross(n, {1.0f, 0.0f, 0.0f});
+    }
+    const float radius = 0.07f;
+    side = side.normalized() * radius;
+    const Vec3 up = physics::cross(n, side).normalized() * radius;
+    const int coils = std::max(6, static_cast<int>(len * 3.0f));
+    const int segs = coils * 8;
+    Vector3 prev = to_rl(a);
+    for (int i = 1; i <= segs; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(segs);
+        const float ang = t * static_cast<float>(coils) * 6.2831853f;
+        const Vec3 p = a + delta * t + side * std::cos(ang) + up * std::sin(ang);
+        const Vector3 cur = to_rl(p);
+        DrawLine3D(prev, cur, color);
+        prev = cur;
+    }
+}
+
+float ray_segment_distance(Vec3 origin, Vec3 dir, Vec3 a, Vec3 b) {
+    const Vec3 u = dir;
+    const Vec3 v = b - a;
+    const Vec3 w = origin - a;
+    const float uu = physics::dot(u, u);
+    const float vv = physics::dot(v, v);
+    const float uv = physics::dot(u, v);
+    const float wu = physics::dot(w, u);
+    const float wv = physics::dot(w, v);
+    const float den = uu * vv - uv * uv;
+    float t_seg = 0.0f;
+    if (den > 1e-8f && vv > 1e-8f) {
+        t_seg = (uu * wv - uv * wu) / den;
+    } else if (vv > 1e-8f) {
+        t_seg = wv / vv;
+    }
+    t_seg = std::clamp(t_seg, 0.0f, 1.0f);
+    float t_ray = 0.0f;
+    if (uu > 1e-8f) {
+        t_ray = (uv * t_seg - wu) / uu;
+    }
+    if (t_ray < 0.05f) {
+        return 1.0e6f;
+    }
+    const Vec3 p_ray = origin + u * t_ray;
+    const Vec3 p_seg = a + v * t_seg;
+    return (p_ray - p_seg).length();
+}
+
+Spring* pick_spring(World& world, Vec3 origin, Vec3 dir, float max_dist) {
+    Spring* best = nullptr;
+    float best_d = max_dist;
+    for (auto& owned : world.springs()) {
+        const float d = ray_segment_distance(origin, dir, owned->point_a(), owned->point_b());
+        if (d < best_d) {
+            best_d = d;
+            best = owned.get();
+        }
+    }
+    return best;
+}
+
+DistanceJoint* pick_rod(World& world, Vec3 origin, Vec3 dir, float max_dist) {
+    DistanceJoint* best = nullptr;
+    float best_d = max_dist;
+    for (auto& owned : world.rods()) {
+        const float d = ray_segment_distance(origin, dir, owned->point_a(), owned->point_b());
+        if (d < best_d) {
+            best_d = d;
+            best = owned.get();
+        }
+    }
+    return best;
+}
+
+void draw_rod(const DistanceJoint& rod, Color color) {
+    DrawCylinderEx(to_rl(rod.point_a()), to_rl(rod.point_b()), 0.035f, 0.035f, 8, color);
+    DrawSphere(to_rl(rod.point_a()), 0.06f, color);
+    DrawSphere(to_rl(rod.point_b()), 0.06f, color);
+}
+
 void draw_body(const Body& body, Color color) {
     const Vector3 pos = to_rl(body.position);
     if (body.shape.type == ShapeType::Sphere) {
@@ -331,6 +423,15 @@ struct Editor {
     Controller ctrl;
     Tool tool = Tool::Select;
     Body* selected = nullptr;
+    Spring* selected_spring = nullptr;
+    DistanceJoint* selected_rod = nullptr;
+    Body* spring_from = nullptr;
+    Vec3 spring_from_local{};
+    Vec3 spring_from_world{};
+    bool rod_from_set = false;
+    Body* rod_from = nullptr;
+    Vec3 rod_from_local{};
+    Vec3 rod_from_world{};
     Body* dragging = nullptr;
     float drag_y = 0.0f;
     bool playing = false;
@@ -355,6 +456,12 @@ struct Editor {
     Vec3 wall_half{0.12f, 1.6f, 3.0f};
     Vec3 ramp_half{2.4f, 0.12f, 1.6f};
     float ramp_angle = 0.35f;
+    float spring_stiffness = 80.0f;
+    float spring_damping = 4.0f;
+    bool spring_bungee = false;
+    float pendulum_length = 2.0f;
+    float place_mass = 1.0f;
+    float place_volume = 0.52f;
 
     Entity* find(Body* body) {
         for (auto& e : entities) {
@@ -390,6 +497,15 @@ struct Editor {
         if (selected == body) {
             selected = nullptr;
         }
+        selected_spring = nullptr;
+        selected_rod = nullptr;
+        if (spring_from == body) {
+            spring_from = nullptr;
+        }
+        if (rod_from == body) {
+            rod_from = nullptr;
+            rod_from_set = false;
+        }
         if (dragging == body) {
             dragging = nullptr;
         }
@@ -406,6 +522,11 @@ struct Editor {
     void clear_world() {
         ctrl.release();
         selected = nullptr;
+        selected_spring = nullptr;
+        selected_rod = nullptr;
+        spring_from = nullptr;
+        rod_from = nullptr;
+        rod_from_set = false;
         dragging = nullptr;
         entities.clear();
         world.clear();
@@ -422,7 +543,7 @@ struct Editor {
         const Color color = brush_color;
         const bool dynamic = (kind == Kind::Sphere || kind == Kind::Box) && place_dynamic;
         const BodyType type = dynamic ? BodyType::Dynamic : BodyType::Static;
-        const float density = 1.0f;
+        const float density = place_mass / std::max(place_volume, 1e-6f);
         Body* body = nullptr;
         const char* prefix = "Object";
 
@@ -433,8 +554,10 @@ struct Editor {
 
         switch (kind) {
             case Kind::Sphere:
+                sphere_r = std::cbrt((3.0f * place_volume) / (4.0f * 3.14159265f));
                 at += n * sphere_r;
                 body = world.add_sphere(at, sphere_r, density, type);
+                physics::set_body_mass(*body, place_mass);
                 body->restitution = 0.4f;
                 body->friction = 0.3f;
                 prefix = "Sphere";
@@ -442,6 +565,8 @@ struct Editor {
             case Kind::Box:
                 at += n * box_half.y;
                 body = world.add_box(at, box_half, density, type);
+                physics::set_body_volume(*body, place_volume);
+                physics::set_body_mass(*body, place_mass);
                 body->restitution = 0.15f;
                 body->friction = 0.45f;
                 prefix = "Box";
@@ -483,7 +608,89 @@ struct Editor {
         }
         bind(body, kind, color, density, prefix);
         selected = body;
+        selected_spring = nullptr;
+        selected_rod = nullptr;
         return body;
+    }
+
+    int index_of(Body* body) const {
+        for (std::size_t i = 0; i < entities.size(); ++i) {
+            if (entities[i].body == body) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    void connect_spring(Body* a, Vec3 world_a, Body* b, Vec3 world_b) {
+        if (a == nullptr || a == b) {
+            spring_from = nullptr;
+            return;
+        }
+        const Vec3 local_a = a->world_to_local(world_a);
+        const Vec3 local_b = b != nullptr ? b->world_to_local(world_b) : world_b;
+        const float rest = std::max((world_b - world_a).length(), 0.05f);
+        selected_spring = world.add_spring(a, b, local_a, local_b, rest, spring_stiffness, spring_damping, spring_bungee);
+        selected = nullptr;
+        spring_from = nullptr;
+        status = b != nullptr ? "Spring linked two objects." : "Spring anchored in the world — Play to see SHM.";
+    }
+
+    Body* spawn_bob(Vec3 at) {
+        sphere_r = std::cbrt((3.0f * place_volume) / (4.0f * 3.14159265f));
+        Body* body = world.add_sphere(at, sphere_r, 1.0f, BodyType::Dynamic);
+        physics::set_body_mass(*body, place_mass);
+        body->restitution = 0.2f;
+        body->friction = 0.15f;
+        bind(body, Kind::Sphere, brush_color, place_mass / std::max(place_volume, 1e-6f), "Bob");
+        return body;
+    }
+
+    void connect_pendulum(Body* first, Vec3 world_first, Body* second, Vec3 world_second) {
+        Body* pivot = first;
+        Vec3 pivot_pt = world_first;
+        Body* bob = second;
+        Vec3 bob_pt = world_second;
+
+        if (bob == nullptr) {
+            Vec3 hang = pivot_pt + Vec3{pendulum_length * 0.35f, -pendulum_length, 0.0f};
+            if (grid_snap) {
+                hang = snap_vec(hang, snap);
+            }
+            bob = spawn_bob(hang);
+            bob_pt = hang;
+        }
+
+        const bool first_static = pivot == nullptr || pivot->type != BodyType::Dynamic;
+        const bool second_dynamic = bob != nullptr && bob->type == BodyType::Dynamic;
+        if (!first_static && (!second_dynamic || bob == pivot)) {
+            // Clicked a dynamic first; treat it as the bob hanging from the second point.
+            std::swap(pivot, bob);
+            std::swap(pivot_pt, bob_pt);
+        }
+
+        if (bob == nullptr || bob == pivot) {
+            rod_from_set = false;
+            rod_from = nullptr;
+            status = "Pendulum needs a swinging mass.";
+            return;
+        }
+
+        if (bob->type != BodyType::Dynamic) {
+            bob->set_type(BodyType::Dynamic);
+            physics::apply_inertia_from_mass(*bob);
+        }
+
+        const Vec3 local_a = bob->world_to_local(bob->position);
+        const Vec3 local_b = pivot != nullptr ? pivot->world_to_local(pivot_pt) : pivot_pt;
+        const float length = std::max((bob->position - pivot_pt).length(), 0.15f);
+        selected_rod = world.add_rod(bob, pivot, local_a, local_b, length, true);
+        selected = bob;
+        selected_spring = nullptr;
+        rod_from_set = false;
+        rod_from = nullptr;
+        status = pivot != nullptr ? "Pendulum hinged on that object. Play to swing under gravity."
+                                  : "Pendulum hinged in world space. Play to swing under gravity.";
     }
 
     std::filesystem::path path_for_name(const char* name) const {
@@ -579,7 +786,7 @@ struct Editor {
             status = "Save failed.";
             return false;
         }
-        out << "PEWORLD 1\n";
+        out << "PEWORLD 2\n";
         out << "gravity " << world.gravity.x << ' ' << world.gravity.y << ' ' << world.gravity.z << '\n';
         out << "count " << entities.size() << '\n';
         for (const auto& e : entities) {
@@ -589,7 +796,21 @@ struct Editor {
                 << static_cast<int>(b.type) << ' ' << b.restitution << ' ' << b.friction << ' ' << b.position.x << ' '
                 << b.position.y << ' ' << b.position.z << ' ' << b.orientation.w << ' ' << b.orientation.x << ' '
                 << b.orientation.y << ' ' << b.orientation.z << ' ' << b.shape.radius << ' ' << b.shape.half_extents.x
-                << ' ' << b.shape.half_extents.y << ' ' << b.shape.half_extents.z << '\n';
+                << ' ' << b.shape.half_extents.y << ' ' << b.shape.half_extents.z << ' ' << b.mass << '\n';
+        }
+        out << "springs " << world.springs().size() << '\n';
+        for (const auto& owned : world.springs()) {
+            const Spring& s = *owned;
+            out << index_of(s.a) << ' ' << index_of(s.b) << ' ' << s.rest_length << ' ' << s.stiffness << ' '
+                << s.damping << ' ' << (s.bungee ? 1 : 0) << ' ' << s.local_a.x << ' ' << s.local_a.y << ' '
+                << s.local_a.z << ' ' << s.local_b.x << ' ' << s.local_b.y << ' ' << s.local_b.z << '\n';
+        }
+        out << "rods " << world.rods().size() << '\n';
+        for (const auto& owned : world.rods()) {
+            const DistanceJoint& j = *owned;
+            out << index_of(j.a) << ' ' << index_of(j.b) << ' ' << j.length << ' ' << (j.pendulum ? 1 : 0) << ' '
+                << j.local_a.x << ' ' << j.local_a.y << ' ' << j.local_a.z << ' ' << j.local_b.x << ' ' << j.local_b.y
+                << ' ' << j.local_b.z << '\n';
         }
         status = std::string("Saved ") + path;
         return true;
@@ -622,6 +843,10 @@ struct Editor {
             if (!in) {
                 break;
             }
+            float mass = -1.0f;
+            if (version >= 2) {
+                in >> mass;
+            }
             const Kind kind = static_cast<Kind>(kind_i);
             const BodyType type = static_cast<BodyType>(type_i);
             Body* body = nullptr;
@@ -633,12 +858,52 @@ struct Editor {
             body->orientation = {qw, qx, qy, qz};
             body->restitution = rest;
             body->friction = fric;
+            if (mass > 0.0f) {
+                physics::set_body_mass(*body, mass);
+            }
             bind(body, kind, Color{static_cast<unsigned char>(cr), static_cast<unsigned char>(cg),
                                    static_cast<unsigned char>(cb), 255},
                  density, "Loaded");
             std::snprintf(entities.back().name, sizeof(entities.back().name), "%s", name);
         }
+        while (in >> tag) {
+            if (tag == "springs") {
+                std::size_t n_springs = 0;
+                in >> n_springs;
+                for (std::size_t i = 0; i < n_springs; ++i) {
+                    int ia = -1, ib = -1, bungee_i = 0;
+                    float rest_l = 1.0f, k = 80.0f, damp = 4.0f, lax = 0, lay = 0, laz = 0, lbx = 0, lby = 0, lbz = 0;
+                    in >> ia >> ib >> rest_l >> k >> damp >> bungee_i >> lax >> lay >> laz >> lbx >> lby >> lbz;
+                    if (!in || ia < 0 || ia >= static_cast<int>(entities.size())) {
+                        continue;
+                    }
+                    Body* a = entities[static_cast<std::size_t>(ia)].body;
+                    Body* b = (ib >= 0 && ib < static_cast<int>(entities.size()))
+                                  ? entities[static_cast<std::size_t>(ib)].body
+                                  : nullptr;
+                    world.add_spring(a, b, {lax, lay, laz}, {lbx, lby, lbz}, rest_l, k, damp, bungee_i != 0);
+                }
+            } else if (tag == "rods") {
+                std::size_t n_rods = 0;
+                in >> n_rods;
+                for (std::size_t i = 0; i < n_rods; ++i) {
+                    int ia = -1, ib = -1, pend_i = 0;
+                    float length = 1.0f, lax = 0, lay = 0, laz = 0, lbx = 0, lby = 0, lbz = 0;
+                    in >> ia >> ib >> length >> pend_i >> lax >> lay >> laz >> lbx >> lby >> lbz;
+                    if (!in || ia < 0 || ia >= static_cast<int>(entities.size())) {
+                        continue;
+                    }
+                    Body* a = entities[static_cast<std::size_t>(ia)].body;
+                    Body* b = (ib >= 0 && ib < static_cast<int>(entities.size()))
+                                  ? entities[static_cast<std::size_t>(ib)].body
+                                  : nullptr;
+                    world.add_rod(a, b, {lax, lay, laz}, {lbx, lby, lbz}, length, pend_i != 0);
+                }
+            }
+        }
         selected = nullptr;
+        selected_spring = nullptr;
+        selected_rod = nullptr;
         status = std::string("Loaded ") + path;
         return true;
     }
@@ -732,7 +997,9 @@ Kind kind_from_tool(Tool tool) {
 
 void apply_shape(Entity& e) {
     Body& b = *e.body;
-    physics::compute_mass(b, e.density);
+    physics::apply_inertia_from_mass(b);
+    const float vol = std::max(physics::body_volume(b), 1e-8f);
+    e.density = b.mass / vol;
     if (b.type != BodyType::Dynamic) {
         b.set_type(BodyType::Static);
     }
@@ -820,8 +1087,25 @@ int main() {
             if (IsKeyPressed(KEY_SIX)) {
                 editor.tool = Tool::Ramp;
             }
+            if (IsKeyPressed(KEY_SEVEN)) {
+                editor.tool = Tool::Spring;
+                editor.spring_from = nullptr;
+            }
+            if (IsKeyPressed(KEY_EIGHT)) {
+                editor.tool = Tool::Pendulum;
+                editor.rod_from = nullptr;
+                editor.rod_from_set = false;
+            }
             if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) {
-                if (editor.selected != nullptr) {
+                if (editor.selected_spring != nullptr) {
+                    editor.world.destroy_spring(editor.selected_spring);
+                    editor.selected_spring = nullptr;
+                    editor.status = "Deleted spring.";
+                } else if (editor.selected_rod != nullptr) {
+                    editor.world.destroy_rod(editor.selected_rod);
+                    editor.selected_rod = nullptr;
+                    editor.status = "Deleted pendulum rod.";
+                } else if (editor.selected != nullptr) {
                     editor.remove_entity(editor.selected);
                     editor.status = "Deleted object.";
                 }
@@ -871,8 +1155,17 @@ int main() {
                 editor.ctrl.release();
             } else if (editor.playing) {
                 editor.stop_play();
+            } else if (editor.spring_from != nullptr) {
+                editor.spring_from = nullptr;
+                editor.status = "Spring placement cancelled.";
+            } else if (editor.rod_from_set) {
+                editor.rod_from_set = false;
+                editor.rod_from = nullptr;
+                editor.status = "Pendulum placement cancelled.";
             } else {
                 editor.selected = nullptr;
+                editor.selected_spring = nullptr;
+                editor.selected_rod = nullptr;
             }
         }
         if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_S)) {
@@ -898,7 +1191,28 @@ int main() {
         if (!modal && !editor.playing && in_view && !ui.hovered && !editor.ctrl.looking) {
             if (editor.tool == Tool::Select) {
                 if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                    editor.selected = world_hit ? world_hit->body : nullptr;
+                    Spring* spring_hit = pick_spring(editor.world, origin, dir, 0.25f);
+                    DistanceJoint* rod_hit = pick_rod(editor.world, origin, dir, 0.25f);
+                    const float spring_d = spring_hit != nullptr
+                                               ? ray_segment_distance(origin, dir, spring_hit->point_a(),
+                                                                      spring_hit->point_b())
+                                               : 1.0e6f;
+                    const float rod_d = rod_hit != nullptr
+                                            ? ray_segment_distance(origin, dir, rod_hit->point_a(), rod_hit->point_b())
+                                            : 1.0e6f;
+                    if (spring_hit != nullptr && spring_d <= rod_d && spring_d < 0.18f) {
+                        editor.selected_spring = spring_hit;
+                        editor.selected_rod = nullptr;
+                        editor.selected = nullptr;
+                    } else if (rod_hit != nullptr && rod_d < 0.18f) {
+                        editor.selected_rod = rod_hit;
+                        editor.selected_spring = nullptr;
+                        editor.selected = nullptr;
+                    } else {
+                        editor.selected = world_hit ? world_hit->body : nullptr;
+                        editor.selected_spring = nullptr;
+                        editor.selected_rod = nullptr;
+                    }
                     if (editor.selected != nullptr) {
                         editor.dragging = editor.selected;
                         editor.drag_y = editor.selected->position.y;
@@ -922,7 +1236,48 @@ int main() {
                 if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                     editor.dragging = nullptr;
                 }
-            } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && place_hit) {
+            } else if (editor.tool == Tool::Spring && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                if (editor.spring_from == nullptr) {
+                    if (world_hit && world_hit->body != nullptr) {
+                        editor.spring_from = world_hit->body;
+                        editor.spring_from_world = world_hit->point;
+                        editor.spring_from_local = world_hit->body->world_to_local(world_hit->point);
+                        editor.status = "Spring start set. Click another object, or empty space for a world anchor.";
+                    }
+                } else if (world_hit && world_hit->body != nullptr) {
+                    editor.connect_spring(editor.spring_from, editor.spring_from->local_to_world(editor.spring_from_local),
+                                          world_hit->body, world_hit->point);
+                } else if (place_hit) {
+                    editor.connect_spring(editor.spring_from, editor.spring_from->local_to_world(editor.spring_from_local),
+                                          nullptr, place_hit->point);
+                }
+            } else if (editor.tool == Tool::Pendulum && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                if (!editor.rod_from_set) {
+                    if (world_hit && world_hit->body != nullptr) {
+                        editor.rod_from_set = true;
+                        editor.rod_from = world_hit->body;
+                        editor.rod_from_world = world_hit->point;
+                        editor.rod_from_local = world_hit->body->world_to_local(world_hit->point);
+                        editor.status = "Pivot set. Click a mass, or empty space to hang a new bob.";
+                    } else if (place_hit) {
+                        editor.rod_from_set = true;
+                        editor.rod_from = nullptr;
+                        editor.rod_from_world = place_hit->point;
+                        editor.rod_from_local = place_hit->point;
+                        editor.status = "World pivot set. Click a mass, or empty space to hang a new bob.";
+                    }
+                } else {
+                    const Vec3 from = editor.rod_from != nullptr
+                                          ? editor.rod_from->local_to_world(editor.rod_from_local)
+                                          : editor.rod_from_world;
+                    if (world_hit && world_hit->body != nullptr && world_hit->body != editor.rod_from) {
+                        editor.connect_pendulum(editor.rod_from, from, world_hit->body, world_hit->point);
+                    } else if (place_hit) {
+                        editor.connect_pendulum(editor.rod_from, from, nullptr, place_hit->point);
+                    }
+                }
+            } else if (editor.tool != Tool::Spring && editor.tool != Tool::Pendulum &&
+                       IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && place_hit) {
                 editor.spawn(kind_from_tool(editor.tool), place_hit->point, place_hit->normal);
                 editor.status = "Placed object.";
             }
@@ -958,8 +1313,26 @@ int main() {
             }
             draw_body(*e.body, c);
         }
+        for (const auto& owned : editor.world.springs()) {
+            const bool sel = owned.get() == editor.selected_spring;
+            draw_spring(*owned, sel ? Color{255, 224, 130, 255} : Color{255, 183, 77, 255});
+        }
+        for (const auto& owned : editor.world.rods()) {
+            const bool sel = owned.get() == editor.selected_rod;
+            draw_rod(*owned, sel ? Color{255, 224, 130, 255} : Color{186, 104, 200, 255});
+        }
+        if (editor.spring_from != nullptr && place_hit) {
+            DrawLine3D(to_rl(editor.spring_from->local_to_world(editor.spring_from_local)), to_rl(place_hit->point),
+                       Color{255, 241, 118, 255});
+        }
+        if (editor.rod_from_set && place_hit) {
+            const Vec3 from = editor.rod_from != nullptr ? editor.rod_from->local_to_world(editor.rod_from_local)
+                                                        : editor.rod_from_world;
+            DrawLine3D(to_rl(from), to_rl(place_hit->point), Color{206, 147, 216, 255});
+        }
 
-        if (!editor.playing && editor.tool != Tool::Select && in_view && place_hit && !ui.hovered) {
+        if (!editor.playing && editor.tool != Tool::Select && editor.tool != Tool::Spring &&
+            editor.tool != Tool::Pendulum && in_view && place_hit && !ui.hovered) {
             Body ghost;
             ghost.position = place_hit->point;
             ghost.orientation = Quat::identity();
@@ -1033,10 +1406,13 @@ int main() {
         auto tool_btn = [&](Tool t, const char* name, const char* key) {
             char label[48];
             std::snprintf(label, sizeof(label), "%s  %s", key, name);
-            if (ui::button(ui, {14, ty, 160, 34}, label, editor.tool == t)) {
+            if (ui::button(ui, {14, ty, 160, 28}, label, editor.tool == t)) {
                 editor.tool = t;
+                editor.spring_from = nullptr;
+                editor.rod_from = nullptr;
+                editor.rod_from_set = false;
             }
-            ty += 40;
+            ty += 32;
         };
         tool_btn(Tool::Select, "Select", "1");
         tool_btn(Tool::Sphere, "Sphere", "2");
@@ -1044,17 +1420,30 @@ int main() {
         tool_btn(Tool::Floor, "Floor", "4");
         tool_btn(Tool::Wall, "Wall", "5");
         tool_btn(Tool::Ramp, "Ramp", "6");
+        tool_btn(Tool::Spring, "Spring", "7");
+        tool_btn(Tool::Pendulum, "Pendulum", "8");
 
         ty += 8;
         ui::label(16, static_cast<int>(ty), "BRUSH", GRAY, 14);
         ty += 24;
-        if (editor.tool == Tool::Sphere || editor.tool == Tool::Box) {
+        if (editor.tool == Tool::Sphere || editor.tool == Tool::Box || editor.tool == Tool::Pendulum) {
             editor.place_dynamic =
-                ui::toggle(ui, {14, ty, 160, 30}, editor.place_dynamic ? "Dynamic" : "Static", editor.place_dynamic);
-            ty += 44;
+                ui::toggle(ui, {14, ty, 160, 28}, editor.place_dynamic ? "Dynamic" : "Static", editor.place_dynamic);
+            ty += 36;
+            editor.place_mass = ui::slider(ui, {14, ty + 16, 160, 16}, editor.place_mass, 0.05f, 50.0f, "Mass");
+            const float vol = ui::slider(ui, {14, ty + 56, 160, 16}, editor.place_volume, 0.02f, 40.0f, "Volume");
+            if (std::abs(vol - editor.place_volume) > 1e-6f) {
+                editor.place_volume = vol;
+                editor.sphere_r = std::cbrt((3.0f * vol) / (4.0f * 3.14159265f));
+            }
+            ty += 92;
         }
         if (editor.tool == Tool::Sphere) {
-            editor.sphere_r = ui::slider(ui, {14, ty + 16, 160, 16}, editor.sphere_r, 0.15f, 4.0f, "Radius");
+            const float r = ui::slider(ui, {14, ty + 16, 160, 16}, editor.sphere_r, 0.15f, 4.0f, "Radius");
+            if (std::abs(r - editor.sphere_r) > 1e-6f) {
+                editor.sphere_r = r;
+                editor.place_volume = (4.0f / 3.0f) * 3.14159265f * r * r * r;
+            }
             ty += 50;
         } else if (editor.tool == Tool::Box) {
             editor.box_half.x = ui::slider(ui, {14, ty + 16, 160, 16}, editor.box_half.x, 0.15f, 6.0f, "Width");
@@ -1071,6 +1460,18 @@ int main() {
             ty += 90;
         } else if (editor.tool == Tool::Ramp) {
             editor.ramp_angle = ui::slider(ui, {14, ty + 16, 160, 16}, editor.ramp_angle, 0.1f, 0.8f, "Angle");
+            ty += 50;
+        } else if (editor.tool == Tool::Spring) {
+            editor.spring_stiffness =
+                ui::slider(ui, {14, ty + 16, 160, 16}, editor.spring_stiffness, 5.0f, 400.0f, "Stiffness k");
+            editor.spring_damping =
+                ui::slider(ui, {14, ty + 56, 160, 16}, editor.spring_damping, 0.0f, 40.0f, "Damping");
+            editor.spring_bungee =
+                ui::toggle(ui, {14, ty + 88, 160, 28}, editor.spring_bungee ? "Bungee" : "SHM spring", editor.spring_bungee);
+            ty += 128;
+        } else if (editor.tool == Tool::Pendulum) {
+            editor.pendulum_length =
+                ui::slider(ui, {14, ty + 16, 160, 16}, editor.pendulum_length, 0.3f, 8.0f, "Rod length");
             ty += 50;
         }
 
@@ -1099,10 +1500,40 @@ int main() {
 
         ui::label(static_cast<int>(right.x + 16), 60, "INSPECTOR", GRAY, 14);
         Entity* sel = editor.find(editor.selected);
-        if (sel == nullptr) {
-            ui::label(static_cast<int>(right.x + 16), 96, "Click an object to edit it.", DARKGRAY, 16);
-            ui::label(static_cast<int>(right.x + 16), 124, "Or choose a tool and click", DARKGRAY, 16);
-            ui::label(static_cast<int>(right.x + 16), 144, "in the viewport to place.", DARKGRAY, 16);
+        if (editor.selected_spring != nullptr) {
+            Spring& s = *editor.selected_spring;
+            const float rx = right.x + 16;
+            ui::label(static_cast<int>(rx), 88, "Spring (Hooke's law)", RAYWHITE, 20);
+            ui::label(static_cast<int>(rx), 114, s.b != nullptr ? "Object to object" : "World-anchored SHM", GRAY, 16);
+            s.stiffness = ui::slider(ui, {rx, 160, 268, 16}, s.stiffness, 5.0f, 400.0f, "Stiffness k");
+            s.damping = ui::slider(ui, {rx, 200, 268, 16}, s.damping, 0.0f, 40.0f, "Damping c");
+            s.rest_length = ui::slider(ui, {rx, 240, 268, 16}, s.rest_length, 0.05f, 12.0f, "Rest length");
+            s.bungee = ui::toggle(ui, {rx, 270, 268, 30}, s.bungee ? "Bungee (tension only)" : "SHM spring (push+pull)",
+                                  s.bungee);
+            if (ui::button(ui, {rx, 320, 268, 32}, "Delete spring")) {
+                editor.world.destroy_spring(&s);
+                editor.selected_spring = nullptr;
+            }
+        } else if (editor.selected_rod != nullptr) {
+            DistanceJoint& j = *editor.selected_rod;
+            const float rx = right.x + 16;
+            ui::label(static_cast<int>(rx), 88, j.pendulum ? "Pendulum rod" : "Distance rod", RAYWHITE, 20);
+            ui::label(static_cast<int>(rx), 114, j.b != nullptr ? "Hinged on an object / plane" : "World-space pivot",
+                      GRAY, 16);
+            j.length = ui::slider(ui, {rx, 160, 268, 16}, j.length, 0.15f, 12.0f, "Length");
+            j.pendulum = ui::toggle(ui, {rx, 196, 268, 30}, j.pendulum ? "Pendulum" : "Rigid rod", j.pendulum);
+            if (ui::button(ui, {rx, 246, 268, 32}, "Delete rod")) {
+                editor.world.destroy_rod(&j);
+                editor.selected_rod = nullptr;
+            }
+        } else if (sel == nullptr) {
+            const float rx = right.x + 16;
+            ui::label(static_cast<int>(rx), 96, "World physics", RAYWHITE, 18);
+            editor.world.gravity.y =
+                ui::slider(ui, {rx, 140, 268, 16}, editor.world.gravity.y, -20.0f, 0.0f, "Gravity Y");
+            ui::label(static_cast<int>(rx), 180, "Click an object, spring, or rod.", DARKGRAY, 16);
+            ui::label(static_cast<int>(rx), 204, "Pendulum: click a plane/pivot, then a mass", DARKGRAY, 16);
+            ui::label(static_cast<int>(rx), 224, "(or empty space to hang a new bob).", DARKGRAY, 16);
         } else {
             Body& b = *sel->body;
             ui::label(static_cast<int>(right.x + 16), 88, sel->name, RAYWHITE, 20);
@@ -1126,7 +1557,7 @@ int main() {
             if (want_dyn != is_dyn) {
                 b.set_type(want_dyn ? BodyType::Dynamic : BodyType::Static);
                 if (want_dyn) {
-                    physics::compute_mass(b, sel->density);
+                    physics::apply_inertia_from_mass(b);
                 }
             }
 
@@ -1135,33 +1566,49 @@ int main() {
             b.position.z = ui::slider(ui, {rx, 276, 268, 16}, b.position.z, -24.0f, 24.0f, "Position Z");
             b.prev_position = b.position;
 
+            const float mass = ui::slider(ui, {rx, 326, 268, 16}, b.mass, 0.05f, 80.0f, "Mass");
+            if (std::abs(mass - b.mass) > 1e-5f) {
+                physics::set_body_mass(b, mass);
+                apply_shape(*sel);
+            }
+            const float vol_now = physics::body_volume(b);
+            const float vol = ui::slider(ui, {rx, 366, 268, 16}, vol_now, 0.02f, 80.0f, "Volume");
+            if (std::abs(vol - vol_now) > 1e-5f) {
+                physics::set_body_volume(b, vol);
+                apply_shape(*sel);
+            }
+            char dens[64];
+            std::snprintf(dens, sizeof(dens), "Density  %.3f", static_cast<double>(sel->density));
+            ui::label(static_cast<int>(rx), 390, dens, GRAY, 14);
+
             if (b.shape.type == ShapeType::Sphere) {
-                const float r = ui::slider(ui, {rx, 326, 268, 16}, b.shape.radius, 0.15f, 6.0f, "Radius");
+                const float r = ui::slider(ui, {rx, 426, 268, 16}, b.shape.radius, 0.15f, 6.0f, "Radius");
                 if (r != b.shape.radius) {
                     b.shape.radius = r;
                     apply_shape(*sel);
                 }
             } else {
-                const float hx = ui::slider(ui, {rx, 326, 268, 16}, b.shape.half_extents.x, 0.08f, 20.0f, "Half width");
-                const float hy = ui::slider(ui, {rx, 366, 268, 16}, b.shape.half_extents.y, 0.08f, 12.0f, "Half height");
-                const float hz = ui::slider(ui, {rx, 406, 268, 16}, b.shape.half_extents.z, 0.08f, 20.0f, "Half depth");
+                const float hx = ui::slider(ui, {rx, 426, 268, 16}, b.shape.half_extents.x, 0.08f, 20.0f, "Half width");
+                const float hy = ui::slider(ui, {rx, 466, 268, 16}, b.shape.half_extents.y, 0.08f, 12.0f, "Half height");
+                const float hz = ui::slider(ui, {rx, 506, 268, 16}, b.shape.half_extents.z, 0.08f, 20.0f, "Half depth");
                 if (hx != b.shape.half_extents.x || hy != b.shape.half_extents.y || hz != b.shape.half_extents.z) {
                     b.shape.half_extents = {hx, hy, hz};
                     apply_shape(*sel);
                 }
             }
 
-            b.restitution = ui::slider(ui, {rx, 456, 268, 16}, b.restitution, 0.0f, 1.0f, "Bounciness");
-            b.friction = ui::slider(ui, {rx, 496, 268, 16}, b.friction, 0.0f, 1.2f, "Friction");
+            b.restitution = ui::slider(ui, {rx, 556, 268, 16}, b.restitution, 0.0f, 1.0f, "Bounciness");
+            b.friction = ui::slider(ui, {rx, 596, 268, 16}, b.friction, 0.0f, 1.2f, "Friction");
+            b.linear_damping = ui::slider(ui, {rx, 636, 268, 16}, b.linear_damping, 0.0f, 2.0f, "Linear damping");
 
-            if (ui::button(ui, {rx, 536, 128, 32}, "Duplicate")) {
+            if (ui::button(ui, {rx, 676, 128, 32}, "Duplicate")) {
                 editor.brush_color = sel->color;
                 Body* copy = editor.spawn(sel->kind, b.position + Vec3{1, 0, 0}, {0, 1, 0});
                 if (copy != nullptr) {
                     copy->orientation = b.orientation;
                 }
             }
-            if (ui::button(ui, {rx + 140, 536, 128, 32}, "Delete")) {
+            if (ui::button(ui, {rx + 140, 676, 128, 32}, "Delete")) {
                 editor.remove_entity(sel->body);
                 sel = nullptr;
             }
